@@ -205,6 +205,24 @@ ACTION_RECIPES = {
         safe_default=False,
         powershell=r"net accounts /lockoutthreshold:10",
     ),
+    "misc_reg_keys": ActionRecipe(
+        id="misc_reg_keys",
+        title="Misc Registry Keys (by john)",
+        description="Set multiple security-related registry values: RunAsPPL, DisableWebPnPDownload, NoDriveTypeAutoRun, and WUA service startup.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=True,
+        powershell=r"New-Item -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Printers' -Force -ErrorAction SilentlyContinue | Out-Null; New-Item -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Force -ErrorAction SilentlyContinue | Out-Null; Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'RunAsPPL' -Value 1 -Type DWord -ErrorAction Stop; Set-ItemProperty -Path 'HKLM:\Software\Policies\Microsoft\Windows NT\Printers' -Name 'DisableWebPnPDownload' -Value 1 -Type DWord -ErrorAction Stop; Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'NoDriveTypeAutoRun' -Value 255 -Type DWord -ErrorAction Stop; Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv' -Name 'Start' -Value 2 -Type DWord -ErrorAction Stop",
+    ),
+    "install_gemini_cli": ActionRecipe(
+        id="install_gemini_cli",
+        title="Install Gemini CLI",
+        description="Check/install Node.js and npm, update npm, then install Google Gemini CLI globally.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=False,
+        powershell=r"if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Write-Host 'npm not found, installing Node.js...'; winget install -e --id OpenJS.NodeJS -ErrorAction SilentlyContinue | Out-Null; if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw 'Node.js installation failed' } }; Write-Host 'Updating npm...'; npm install -g npm --ErrorAction Stop | Out-Null; Write-Host 'Installing Gemini CLI...'; $env:GOOGLE_API_KEY='AIzaSyBB8sDOwKv2WDQPAECbALSsR3AxCjlcEas'; npm install -g @google/gemini-cli -ErrorAction Stop",
+    ),
 }
 
 
@@ -241,14 +259,6 @@ def _text_or_empty(elem):
     return elem.text.strip()
 
 
-def _find_first_desc_text(root, node_name: str) -> str:
-    for elem in _iter_xml_nodes(root, node_name):
-        txt = _text_or_empty(elem)
-        if txt:
-            return txt
-    return ""
-
-
 def _find_all_text_pairs(root):
     rows = []
     for ext in _iter_xml_nodes(root, "ExtensionData"):
@@ -262,11 +272,6 @@ def _find_all_text_pairs(root):
     return rows
 
 
-def _safe_int(value, default=None):
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return default
 
 
 def analyze_gpo_xml_report(xml_text: str) -> dict:
@@ -880,7 +885,7 @@ class ForensicsToolApp:
             self.status_var.set("GPO audit failed")
             messagebox.showerror("GPO audit failed", str(ex))
 
-    def on_gpo_selected(self, event=None):
+    def on_gpo_selected(self, _event=None):
         if not self.gpo_tree.selection():
             return
 
@@ -1171,7 +1176,7 @@ class ForensicsToolApp:
         )
         self.apply_tree_tags(self.apps_tree)
 
-    def on_user_selected(self, event=None):
+    def on_user_selected(self, _event=None):
         if not self.users_tree.selection():
             return
 
@@ -1359,23 +1364,38 @@ class ForensicsToolApp:
         self.actions_summary_var = ttk.StringVar(value="No actions generated yet.")
         ttk.Label(topbar, textvariable=self.actions_summary_var, bootstyle="secondary").pack(side=LEFT, padx=12)
 
+        # Create sub-tab notebook for different action categories
         upper = ttk.Frame(self.actions_tab)
         upper.pack(fill=BOTH, expand=YES)
 
-        self.actions_tree = self.build_tree_with_scrollbars(
-            upper,
-            ("severity", "safe", "source", "title", "reason"),
-            [
-                ("severity", "Severity", 90),
-                ("safe", "Safe", 70),
-                ("source", "Source", 220),
-                ("title", "Action", 300),
-                ("reason", "Reason", 520),
-            ],
-            bootstyle="warning",
-        )
-        self.apply_tree_tags(self.actions_tree)
-        self.actions_tree.bind("<<TreeviewSelect>>", self.on_action_selected)
+        self.actions_notebook = ttk.Notebook(upper, bootstyle="warning")
+        self.actions_notebook.pack(fill=BOTH, expand=YES)
+
+        # Create tabs for each source category
+        self.action_tabs = {}
+        self.action_trees = {}
+
+        categories = ["Users", "Tasks", "Other", "Prebake"]
+        for category in categories:
+            tab_frame = ttk.Frame(self.actions_notebook, padding=10)
+            self.actions_notebook.add(tab_frame, text=category)
+            self.action_tabs[category] = tab_frame
+
+            tree = self.build_tree_with_scrollbars(
+                tab_frame,
+                ("severity", "safe", "source", "title", "reason"),
+                [
+                    ("severity", "Severity", 90),
+                    ("safe", "Safe", 70),
+                    ("source", "Source", 220),
+                    ("title", "Action", 300),
+                    ("reason", "Reason", 520),
+                ],
+                bootstyle="warning",
+            )
+            self.apply_tree_tags(tree)
+            tree.bind("<<TreeviewSelect>>", self.on_action_selected)
+            self.action_trees[category] = tree
 
         detail_frame = ttk.Labelframe(self.actions_tab, text="Action Details", padding=12, bootstyle="warning")
         detail_frame.pack(fill=BOTH, expand=YES, pady=(12, 0))
@@ -2009,7 +2029,7 @@ class ForensicsToolApp:
             self.log_debug(traceback.format_exc())
             messagebox.showerror("User audit failed", str(ex))
 
-    def on_question_selected(self, event=None):
+    def on_question_selected(self, _event=None):
         if not self.question_list.curselection():
             return
         idx = self.question_list.curselection()[0]
@@ -2028,7 +2048,7 @@ class ForensicsToolApp:
         self.answer_var.set(answer_text)
         self.question_path_var.set(str(q["path"]))
 
-    def on_report_selected(self, event=None):
+    def on_report_selected(self, _event=None):
         if not self.report_list.curselection():
             return
         idx = self.report_list.curselection()[0]
@@ -2041,7 +2061,7 @@ class ForensicsToolApp:
         self.report_text.configure(state="disabled")
         self.report_path_var.set(f"Origin: {report['origin']}")
 
-    def save_current_answer(self, event=None):
+    def save_current_answer(self, _event=None):
         if not self.question_list.curselection():
             messagebox.showwarning("No question selected", "Select a question first.")
             return
@@ -2148,6 +2168,27 @@ class ForensicsToolApp:
     def build_actions_from_findings(self):
         actions = []
         rdp_required = self.readme_indicates_rdp_required()
+
+        # Add prebake actions
+        self.add_action(
+            actions,
+            "misc_reg_keys",
+            source="Prebake",
+            source_name="Misc Registry Keys",
+            reason="Apply security hardening registry settings: LSA protection, printer web PnP, autorun restrictions, and Windows Update automatic startup.",
+            severity="Medium",
+            safe_default=True,
+        )
+
+        self.add_action(
+            actions,
+            "install_gemini_cli",
+            source="Prebake",
+            source_name="Gemini CLI",
+            reason="Install Node.js and npm if needed, update npm, then install Google Gemini CLI globally with API credentials.",
+            severity="Medium",
+            safe_default=False,
+        )
 
         for task in self.tasks:
             if task.get("Suspicious"):
@@ -2279,28 +2320,51 @@ class ForensicsToolApp:
         ))
         return deduped
 
+    def get_action_category(self, action):
+        """Determine which category tab an action belongs to."""
+        source = action.get("Source", "")
+        if source == "User":
+            return "Users"
+        elif source == "Task":
+            return "Tasks"
+        elif source == "Prebake":
+            return "Prebake"
+        else:
+            return "Other"
+
     def populate_actions(self):
         self.actions = self.build_actions_from_findings()
 
-        for item in self.actions_tree.get_children():
-            self.actions_tree.delete(item)
+        # Clear all trees
+        for tree in self.action_trees.values():
+            for item in tree.get_children():
+                tree.delete(item)
 
+        # Organize actions into categories
+        categorized = {cat: [] for cat in ["Users", "Tasks", "Other", "Prebake"]}
         for idx, action in enumerate(self.actions):
-            sev = action.get("Severity", "Info")
-            tag = "High" if sev == "High" else "Medium" if sev == "Medium" else "Low" if sev == "Low" else "Info"
-            self.actions_tree.insert(
-                "",
-                "end",
-                iid=f"action_{idx}",
-                values=(
-                    action.get("Severity", ""),
-                    "Yes" if action.get("SafeDefault") else "No",
-                    action.get("SourceName", action.get("Source", "")),
-                    action.get("Title", ""),
-                    action.get("Reason", ""),
-                ),
-                tags=(tag,),
-            )
+            cat = self.get_action_category(action)
+            categorized[cat].append((idx, action))
+
+        # Populate each category's tree
+        for category, items in categorized.items():
+            tree = self.action_trees[category]
+            for idx, action in items:
+                sev = action.get("Severity", "Info")
+                tag = "High" if sev == "High" else "Medium" if sev == "Medium" else "Low" if sev == "Low" else "Info"
+                tree.insert(
+                    "",
+                    "end",
+                    iid=f"action_{idx}",
+                    values=(
+                        action.get("Severity", ""),
+                        "Yes" if action.get("SafeDefault") else "No",
+                        action.get("SourceName", action.get("Source", "")),
+                        action.get("Title", ""),
+                        action.get("Reason", ""),
+                    ),
+                    tags=(tag,),
+                )
 
         safe_count = sum(1 for a in self.actions if a.get("SafeDefault"))
         self.actions_summary_var.set(f"Actions: {len(self.actions)} | Safe-by-default: {safe_count}")
@@ -2310,13 +2374,19 @@ class ForensicsToolApp:
         self.action_detail_text.insert("1.0", "Select an action to see details.")
         self.action_detail_text.configure(state="disabled")
 
-    def on_action_selected(self, event=None):
-        if not self.actions_tree.selection():
+    def on_action_selected(self, _event=None):
+        # Find which tree has a selection
+        selected_iid = None
+        for tree in self.action_trees.values():
+            if tree.selection():
+                selected_iid = tree.selection()[0]
+                break
+
+        if not selected_iid:
             return
 
-        iid = self.actions_tree.selection()[0]
         try:
-            idx = int(iid.split("_", 1)[1])
+            idx = int(selected_iid.split("_", 1)[1])
         except Exception:
             return
 
@@ -2349,11 +2419,13 @@ class ForensicsToolApp:
 
     def get_selected_action_indexes(self):
         indices = []
-        for iid in self.actions_tree.selection():
-            try:
-                indices.append(int(iid.split("_", 1)[1]))
-            except Exception:
-                continue
+        # Check all trees in each category
+        for tree in self.action_trees.values():
+            for iid in tree.selection():
+                try:
+                    indices.append(int(iid.split("_", 1)[1]))
+                except Exception:
+                    continue
         return [i for i in indices if 0 <= i < len(self.actions)]
 
     def copy_selected_action_command(self):
