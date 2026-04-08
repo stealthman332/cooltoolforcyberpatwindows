@@ -3,13 +3,15 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox
 
+import xml.etree.ElementTree as ET
+
 import traceback
 from ttkbootstrap.widgets.scrolled import ScrolledText
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 
-from collectors import get_installed_programs, get_registry_entries, get_tasks
+from collectors import get_installed_programs, get_registry_entries, get_tasks, run_powershell_json
 from reports import (
     fetch_url_text,
     find_report_candidates_in_directory,
@@ -21,8 +23,530 @@ from reports import (
 from users_audit import compare_users_against_authorized
 
 
+
+
 APP_TITLE = "Forensics Tool v5.3"
 APP_THEME = "superhero"
+
+
+DEFAULT_GPO_NAMES = {
+    "default domain policy",
+    "default domain controllers policy",
+}
+
+GPO_NAME_KEYWORDS_BASELINE = (
+    "baseline",
+    "hardening",
+    "security",
+    "cis",
+    "microsoft baseline",
+)
+
+def get_bool_text(value):
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    return str(value or "")
+
+def looks_like_default_gpo(name: str) -> bool:
+    return (name or "").strip().lower() in DEFAULT_GPO_NAMES
+
+def looks_like_baseline_gpo(name: str) -> bool:
+    n = (name or "").lower()
+    return any(k in n for k in GPO_NAME_KEYWORDS_BASELINE)
+
+def _xml_local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+def _iter_xml_nodes(root, local_name: str):
+    for elem in root.iter():
+        if _xml_local_name(elem.tag) == local_name:
+            yield elem
+
+def _text_or_empty(elem):
+    if elem is None or elem.text is None:
+        return ""
+    return elem.text.strip()
+
+def _find_first_desc_text(root, node_name: str) -> str:
+    for elem in _iter_xml_nodes(root, node_name):
+        txt = _text_or_empty(elem)
+        if txt:
+            return txt
+    return ""
+
+def _find_all_text_pairs(root):
+    rows = []
+    for ext in _iter_xml_nodes(root, "ExtensionData"):
+        texts = []
+        for elem in ext.iter():
+            txt = _text_or_empty(elem)
+            if txt:
+                texts.append(txt)
+        if texts:
+            rows.append(" | ".join(texts))
+    return rows
+
+def _safe_int(value, default=None):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+def analyze_gpo_xml_report(xml_text: str) -> dict:
+    findings = []
+    settings_blob = ""
+    root = None
+
+    try:
+        root = ET.fromstring(xml_text)
+        settings_lines = _find_all_text_pairs(root)
+        settings_blob = "\n".join(settings_lines)
+    except Exception:
+        settings_blob = xml_text or ""
+
+    blob = settings_blob.lower()
+
+    def add_finding(severity, title, detail):
+        findings.append(
+            {
+                "Severity": severity,
+                "Title": title,
+                "Detail": detail,
+            }
+        )
+
+    # Password policy
+    m = re.search(r"minimum password length[^0-9]{0,20}(\d+)", blob, re.I)
+    if m:
+        length = int(m.group(1))
+        if length < 12:
+            add_finding(
+                "High",
+                "Weak password length",
+                f"Minimum password length appears to be {length}.",
+            )
+
+    if re.search(
+        r"password must meet complexity requirements[^a-z]{0,20}(disabled|false|no)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "Password complexity disabled",
+            "Password complexity appears disabled.",
+        )
+
+    m = re.search(r"account lockout threshold[^0-9]{0,20}(\d+)", blob, re.I)
+    if m:
+        threshold = int(m.group(1))
+        if threshold == 0:
+            add_finding(
+                "High",
+                "No account lockout",
+                "Account lockout threshold appears to be 0.",
+            )
+        elif threshold > 10:
+            add_finding(
+                "Medium",
+                "Weak account lockout threshold",
+                f"Account lockout threshold appears high at {threshold}.",
+            )
+
+    # Firewall / Defender
+    if re.search(
+        r"windows defender firewall[^a-z]{0,40}(disabled|off|false|no)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "Firewall disabled",
+            "Windows Defender Firewall appears disabled by policy.",
+        )
+
+    if re.search(
+        r"turn off microsoft defender antivirus[^a-z]{0,40}(enabled|true|yes)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "Defender disabled",
+            "Policy appears to turn off Microsoft Defender Antivirus.",
+        )
+
+    if re.search(
+        r"real-time protection[^a-z]{0,40}(disabled|off|false|no)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "Real-time protection disabled",
+            "Defender real-time protection appears disabled.",
+        )
+
+    # UAC
+    if re.search(
+        r"user account control: run all administrators in admin approval mode[^a-z]{0,40}(disabled|false|no)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "UAC weakened",
+            "Admin Approval Mode appears disabled.",
+        )
+
+    # RDP / NLA
+    if re.search(
+        r"allow users to connect remotely using remote desktop services[^a-z]{0,40}(enabled|true|yes)",
+        blob,
+        re.I,
+    ):
+        if re.search(
+            r"require user authentication for remote connections by using network level authentication[^a-z]{0,40}(disabled|false|no)",
+            blob,
+            re.I,
+        ):
+            add_finding(
+                "High",
+                "RDP without NLA",
+                "RDP appears enabled while NLA appears disabled.",
+            )
+        else:
+            add_finding(
+                "Low",
+                "RDP enabled",
+                "RDP access appears enabled by policy.",
+            )
+
+    # SMB / LAN Manager / NTLM
+    if re.search(
+        r"network security: lan manager authentication level[^|\n]*send lm & ntlm responses",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "Weak LAN Manager auth",
+            "LAN Manager authentication level appears to allow LM/NTLM responses.",
+        )
+
+    if re.search(
+        r"microsoft network client: digitally sign communications \(always\)[^a-z]{0,40}(disabled|false|no)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "Medium",
+            "SMB client signing not required",
+            "SMB client signing does not appear required.",
+        )
+
+    if re.search(
+        r"microsoft network server: digitally sign communications \(always\)[^a-z]{0,40}(disabled|false|no)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "Medium",
+            "SMB server signing not required",
+            "SMB server signing does not appear required.",
+        )
+
+    # Anonymous access
+    if re.search(
+        r"network access: do not allow anonymous enumeration of sam accounts and shares[^a-z]{0,40}(disabled|false|no)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "Anonymous enumeration allowed",
+            "Anonymous enumeration protections appear disabled.",
+        )
+
+    if re.search(
+        r"network access: let everyone permissions apply to anonymous users[^a-z]{0,40}(enabled|true|yes)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "High",
+            "Anonymous users overly permitted",
+            "Everyone permissions appear to apply to anonymous users.",
+        )
+
+    # Cached credentials
+    m = re.search(
+        r"interactive logon: number of previous logons to cache[^0-9]{0,20}(\d+)",
+        blob,
+        re.I,
+    )
+    if m:
+        cached = int(m.group(1))
+        if cached > 10:
+            add_finding(
+                "Medium",
+                "Many cached logons",
+                f"Cached interactive logons appears set to {cached}.",
+            )
+
+    # PowerShell execution (original quick check)
+    if re.search(
+        r"turn on script execution[^|\n]*(allow all scripts|enabled)",
+        blob,
+        re.I,
+    ):
+        add_finding(
+            "Medium",
+            "Permissive PowerShell execution",
+            "PowerShell script execution appears permissive.",
+        )
+
+    # NEW: ExecutionPolicy value explicitly set to Bypass / Unrestricted
+    if re.search(r"executionpolicy[^\n]{0,80}(bypass|unrestricted)", blob, re.I):
+        add_finding(
+            "Medium",
+            "Permissive PowerShell execution",
+            "ExecutionPolicy appears configured to Bypass or Unrestricted in a GPO.",
+        )
+
+    # NEW: policy text mentioning Turn on Script Execution + 'allow all scripts'
+    if "turn on script execution" in blob and "allow all scripts" in blob:
+        add_finding(
+            "Medium",
+            "PowerShell scripts allowed",
+            "Policy 'Turn on Script Execution' is present with language allowing all scripts.",
+        )
+
+    # Audit policy quick checks
+    if "advanced audit policy configuration" not in blob and "audit policy" not in blob:
+        add_finding(
+            "Low",
+            "No obvious audit policy settings",
+            "No obvious audit policy settings were found in this GPO report.",
+        )
+
+    risk_score = 0
+    for f in findings:
+        if f["Severity"] == "High":
+            risk_score += 3
+        elif f["Severity"] == "Medium":
+            risk_score += 2
+        elif f["Severity"] == "Low":
+            risk_score += 1
+
+    if risk_score >= 6:
+        risk = "High"
+    elif risk_score >= 3:
+        risk = "Medium"
+    elif risk_score >= 1:
+        risk = "Low"
+    else:
+        risk = "Info"
+
+    return {
+        "Risk": risk,
+        "RiskScore": risk_score,
+        "Findings": findings,
+        "SettingsBlob": settings_blob,
+    }
+
+def get_gpo_inventory():
+    script = r'''
+$ErrorActionPreference = 'Stop'
+
+try {
+    Import-Module GroupPolicy -ErrorAction Stop
+} catch {
+    [pscustomobject]@{
+        Error = "GroupPolicy module is not available."
+        Gpos = @()
+    } | ConvertTo-Json -Depth 6 -Compress
+    return
+}
+
+$cs = Get-CimInstance Win32_ComputerSystem
+$domainName = [string]$cs.Domain
+$partOfDomain = [bool]$cs.PartOfDomain
+
+if (-not $partOfDomain) {
+    [pscustomobject]@{
+        Error = "Computer is not joined to a domain."
+        Gpos = @()
+    } | ConvertTo-Json -Depth 6 -Compress
+    return
+}
+
+$gpoList = @()
+
+try {
+    $gpos = Get-GPO -All -ErrorAction Stop
+} catch {
+    [pscustomobject]@{
+        Error = ("Failed to query GPOs: " + $_.Exception.Message)
+        Gpos = @()
+    } | ConvertTo-Json -Depth 6 -Compress
+    return
+}
+
+foreach ($g in $gpos) {
+    $xml = $null
+    $links = @()
+    $wmiFilterName = ""
+    $domainLinked = $false
+    $dcLinked = $false
+    $enforced = $false
+
+    try {
+        $xml = Get-GPOReport -Guid $g.Id -ReportType Xml -ErrorAction Stop
+    } catch {
+        $xml = ""
+    }
+
+    try {
+        if ($xml) {
+            [xml]$doc = $xml
+
+            $linkNodes = $doc.SelectNodes("//*[local-name()='LinksTo']")
+            foreach ($ln in $linkNodes) {
+                $somPath = ""
+                $somName = ""
+                $enabled = ""
+                $noOverride = ""
+
+                foreach ($child in $ln.ChildNodes) {
+                    switch ($child.LocalName) {
+                        "SOMPath" { $somPath = [string]$child.InnerText }
+                        "SOMName" { $somName = [string]$child.InnerText }
+                        "Enabled" { $enabled = [string]$child.InnerText }
+                        "NoOverride" { $noOverride = [string]$child.InnerText }
+                    }
+                }
+
+                $targetText = $somPath
+                if (-not $targetText) { $targetText = $somName }
+
+                if ($targetText) {
+                    $links += [pscustomobject]@{
+                        Target = $targetText
+                        Enabled = $enabled
+                        Enforced = $noOverride
+                    }
+
+                    if ($targetText -ieq $domainName -or $targetText -match ("DC=" + ($domainName -replace '\.', ',DC='))) {
+                        $domainLinked = $true
+                    }
+
+                    if ($targetText -match 'OU=Domain Controllers' -or $targetText -match 'Domain Controllers') {
+                        $dcLinked = $true
+                    }
+
+                    if ($noOverride -match 'true') {
+                        $enforced = $true
+                    }
+                }
+            }
+
+            $wmiNode = $doc.SelectSingleNode("//*[local-name()='WMIFilter']/*[local-name()='Name']")
+            if ($wmiNode) {
+                $wmiFilterName = [string]$wmiNode.InnerText
+            }
+        }
+    } catch {
+    }
+
+    $gpoList += [pscustomobject]@{
+        DisplayName = $g.DisplayName
+        Id = [string]$g.Id
+        Owner = $g.Owner
+        CreationTime = $g.CreationTime
+        ModificationTime = $g.ModificationTime
+        GpoStatus = [string]$g.GpoStatus
+        Description = $g.Description
+        XmlReport = $xml
+        Links = @($links)
+        LinkTargets = @($links | ForEach-Object { $_.Target })
+        DomainLinked = [bool]$domainLinked
+        DomainControllersLinked = [bool]$dcLinked
+        Enforced = [bool]$enforced
+        WmiFilter = $wmiFilterName
+    }
+}
+
+[pscustomobject]@{
+    Error = ""
+    DomainName = $domainName
+    PartOfDomain = $partOfDomain
+    Gpos = @($gpoList)
+} | ConvertTo-Json -Depth 8 -Compress
+'''
+    data = run_powershell_json(script) or {}
+
+    if not isinstance(data, dict):
+        return {
+            "Error": "Unexpected response while collecting GPO data.",
+            "DomainName": "",
+            "PartOfDomain": False,
+            "Gpos": [],
+        }
+
+    raw_gpos = data.get("Gpos") or []
+    if isinstance(raw_gpos, dict):
+        raw_gpos = [raw_gpos]
+
+    results = []
+    for gpo in raw_gpos:
+        name = gpo.get("DisplayName", "")
+        analysis = analyze_gpo_xml_report(gpo.get("XmlReport", "") or "")
+        link_targets = gpo.get("LinkTargets") or []
+        if isinstance(link_targets, str):
+            link_targets = [link_targets]
+
+        row = {
+            "DisplayName": name,
+            "Id": gpo.get("Id", ""),
+            "Owner": gpo.get("Owner", ""),
+            "CreationTime": gpo.get("CreationTime", ""),
+            "ModificationTime": gpo.get("ModificationTime", ""),
+            "GpoStatus": gpo.get("GpoStatus", ""),
+            "Description": gpo.get("Description", ""),
+            "IsDefault": looks_like_default_gpo(name),
+            "LooksLikeBaseline": looks_like_baseline_gpo(name),
+            "Risk": analysis["Risk"],
+            "RiskScore": analysis["RiskScore"],
+            "Findings": analysis["Findings"],
+            "SettingsBlob": analysis["SettingsBlob"],
+            "Links": gpo.get("Links") or [],
+            "LinkTargets": link_targets,
+            "Linked": bool(link_targets),
+            "DomainLinked": bool(gpo.get("DomainLinked", False)),
+            "DomainControllersLinked": bool(gpo.get("DomainControllersLinked", False)),
+            "Enforced": bool(gpo.get("Enforced", False)),
+            "WmiFilter": gpo.get("WmiFilter", "") or "",
+        }
+        results.append(row)
+
+    results.sort(key=lambda x: (
+        not x["DomainControllersLinked"],
+        not x["DomainLinked"],
+        not x["Linked"],
+        x["IsDefault"],
+        -x["RiskScore"],
+        x["DisplayName"].lower(),
+    ))
+
+    return {
+        "Error": data.get("Error", "") or "",
+        "DomainName": data.get("DomainName", "") or "",
+        "PartOfDomain": bool(data.get("PartOfDomain", False)),
+        "Gpos": results,
+    }
 
 
 class StatCard(ttk.Frame):
@@ -51,6 +575,7 @@ class ForensicsToolApp:
         self.registry_entries = []
         self.apps = []
         self.user_audit = {}
+        self.gpos = []
 
         self.debug_messages = []
         self.debug_window = None
@@ -60,7 +585,191 @@ class ForensicsToolApp:
         self.configure_styles()
         self.build_ui()
 
-    
+    def build_gpo_tab(self):
+        ttk.Label(self.gpo_tab, text="Group Policy Audit", style="Section.TLabel", bootstyle="primary").pack(anchor="w", pady=(0, 8))
+
+        topbar = ttk.Frame(self.gpo_tab)
+        topbar.pack(fill=X, pady=(0, 10))
+
+        ttk.Button(topbar, text="Analyze GPOs", command=self.analyze_gpos, bootstyle=PRIMARY).pack(side=LEFT)
+
+        self.gpo_summary_var = ttk.StringVar(value="No GPO audit run yet.")
+        ttk.Label(topbar, textvariable=self.gpo_summary_var, bootstyle="secondary").pack(side=LEFT, padx=12)
+
+        upper = ttk.Frame(self.gpo_tab)
+        upper.pack(fill=BOTH, expand=YES)
+
+        self.gpo_tree = self.build_tree_with_scrollbars(
+            upper,
+            ("risk", "custom", "linked", "dc_linked", "baseline", "name", "status", "findings"),
+            [
+                ("risk", "Risk", 80),
+                ("custom", "Custom", 80),
+                ("linked", "Linked", 80),
+                ("dc_linked", "DC Linked", 90),
+                ("baseline", "Baseline-like", 100),
+                ("name", "GPO Name", 300),
+                ("status", "Status", 130),
+                ("findings", "Findings", 430),
+            ],
+            bootstyle="primary",
+        )
+        self.apply_tree_tags(self.gpo_tree)
+        self.gpo_tree.bind("<<TreeviewSelect>>", self.on_gpo_selected)
+
+        detail_frame = ttk.Labelframe(self.gpo_tab, text="GPO Findings", padding=12, bootstyle="primary")
+        detail_frame.pack(fill=BOTH, expand=YES, pady=(12, 0))
+
+        self.gpo_detail_text = tk.Text(
+            detail_frame,
+            wrap="word",
+            height=12,
+            bg="#122033",
+            fg="#e9f2ff",
+            insertbackground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            padx=10,
+            pady=10,
+        )
+        self.gpo_detail_text.pack(fill=BOTH, expand=YES)
+        self.gpo_detail_text.configure(state="disabled")
+
+    def analyze_gpos(self):
+        try:
+            self.status_var.set("Collecting Group Policy data...")
+            self.root.update_idletasks()
+
+            gpo_data = get_gpo_inventory()
+            self.gpos = gpo_data.get("Gpos", [])
+
+            for item in self.gpo_tree.get_children():
+                self.gpo_tree.delete(item)
+
+            error_text = gpo_data.get("Error", "") or ""
+            if error_text and not self.gpos:
+                self.gpo_summary_var.set(error_text)
+                self.status_var.set("GPO audit complete")
+                return
+
+            risky = 0
+            custom = 0
+            linked = 0
+            dc_linked = 0
+
+            for idx, gpo in enumerate(self.gpos):
+                findings = gpo.get("Findings", [])
+                finding_titles = "; ".join(f["Title"] for f in findings[:3]) if findings else "No obvious insecure settings found"
+
+                if not gpo.get("IsDefault"):
+                    custom += 1
+                if gpo.get("Risk") in {"Medium", "High"}:
+                    risky += 1
+                if gpo.get("Linked"):
+                    linked += 1
+                if gpo.get("DomainControllersLinked"):
+                    dc_linked += 1
+
+                if gpo.get("Risk") == "High":
+                    tag = "High"
+                elif gpo.get("Risk") == "Medium":
+                    tag = "Medium"
+                elif gpo.get("DomainControllersLinked"):
+                    tag = "Low"
+                else:
+                    tag = "Info"
+
+                link_summary = ", ".join(gpo.get("LinkTargets", [])[:2])
+                if len(gpo.get("LinkTargets", [])) > 2:
+                    link_summary += " ..."
+
+                self.gpo_tree.insert(
+                    "",
+                    "end",
+                    iid=f"gpo_{idx}",
+                    values=(
+                        gpo.get("Risk", "Info"),
+                        "No" if gpo.get("IsDefault") else "Yes",
+                        "Yes" if gpo.get("Linked") else "No",
+                        "Yes" if gpo.get("DomainControllersLinked") else "No",
+                        "Yes" if gpo.get("LooksLikeBaseline") else "No",
+                        gpo.get("DisplayName", ""),
+                        gpo.get("GpoStatus", ""),
+                        finding_titles,
+                    ),
+                    tags=(tag,),
+                )
+
+            self.gpo_summary_var.set(
+                f"Total GPOs: {len(self.gpos)} | "
+                f"Custom GPOs: {custom} | "
+                f"Risky GPOs: {risky} | "
+                f"Linked GPOs: {linked} | "
+                f"DC-linked: {dc_linked}"
+            )
+
+            self.status_var.set("GPO audit complete")
+        except Exception as ex:
+            self.status_var.set("GPO audit failed")
+            messagebox.showerror("GPO audit failed", str(ex))
+
+
+    def on_gpo_selected(self, event=None):
+        if not self.gpo_tree.selection():
+            return
+
+        iid = self.gpo_tree.selection()[0]
+        try:
+            idx = int(iid.split("_", 1)[1])
+        except Exception:
+            return
+
+        if idx < 0 or idx >= len(self.gpos):
+            return
+
+        gpo = self.gpos[idx]
+
+        lines = [
+            f"Name: {gpo.get('DisplayName', '')}",
+            f"ID: {gpo.get('Id', '')}",
+            f"Default: {'Yes' if gpo.get('IsDefault') else 'No'}",
+            f"Baseline-like: {'Yes' if gpo.get('LooksLikeBaseline') else 'No'}",
+            f"Risk: {gpo.get('Risk', '')}",
+            f"Status: {gpo.get('GpoStatus', '')}",
+            f"Owner: {gpo.get('Owner', '')}",
+            f"Created: {gpo.get('CreationTime', '')}",
+            f"Modified: {gpo.get('ModificationTime', '')}",
+            f"Linked anywhere: {'Yes' if gpo.get('Linked') else 'No'}",
+            f"Linked to domain root: {'Yes' if gpo.get('DomainLinked') else 'No'}",
+            f"Linked to Domain Controllers: {'Yes' if gpo.get('DomainControllersLinked') else 'No'}",
+            f"Enforced somewhere: {'Yes' if gpo.get('Enforced') else 'No'}",
+            f"WMI Filter: {gpo.get('WmiFilter', '') or 'None'}",
+            "",
+            "Link targets:",
+        ]
+
+        link_targets = gpo.get("LinkTargets", [])
+        if link_targets:
+            for target in link_targets:
+                lines.append(f"- {target}")
+        else:
+            lines.append("- None")
+
+        lines.append("")
+        lines.append("Findings:")
+
+        findings = gpo.get("Findings", [])
+        if findings:
+            for f in findings:
+                lines.append(f"- [{f['Severity']}] {f['Title']}: {f['Detail']}")
+        else:
+            lines.append("- No obvious insecure settings found by quick audit.")
+
+        self.gpo_detail_text.configure(state="normal")
+        self.gpo_detail_text.delete("1.0", "end")
+        self.gpo_detail_text.insert("1.0", "\n".join(lines))
+        self.gpo_detail_text.configure(state="disabled")
+
     def log_debug(self, message: str):
         text = str(message)
         self.debug_messages.append(text)
@@ -71,7 +780,6 @@ class ForensicsToolApp:
                 self.debug_text.see("end")
             except Exception:
                 pass
-
 
     def open_debug_window(self):
         if self.debug_window is not None and self.debug_window.winfo_exists():
@@ -103,7 +811,6 @@ class ForensicsToolApp:
         except Exception:
             pass
 
-
     def clear_debug_log(self):
         self.debug_messages.clear()
         if self.debug_text is not None:
@@ -112,13 +819,11 @@ class ForensicsToolApp:
             except Exception:
                 pass
 
-
     def copy_debug_log(self):
         all_text = "\n".join(self.debug_messages)
         self.root.clipboard_clear()
         self.root.clipboard_append(all_text)
         self.status_var.set("Debug log copied to clipboard")
-
 
     def configure_styles(self):
         self.style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
@@ -161,6 +866,7 @@ class ForensicsToolApp:
         self.users_tab = ttk.Frame(self.notebook, padding=14)
         self.questions_tab = ttk.Frame(self.notebook, padding=14)
         self.reports_tab = ttk.Frame(self.notebook, padding=14)
+        self.gpo_tab = ttk.Frame(self.notebook, padding=14)
 
         self.notebook.add(self.overview_tab, text="Overview")
         self.notebook.add(self.tasks_tab, text="Tasks")
@@ -169,6 +875,7 @@ class ForensicsToolApp:
         self.notebook.add(self.users_tab, text="Users")
         self.notebook.add(self.questions_tab, text="Questions")
         self.notebook.add(self.reports_tab, text="Reports")
+        self.notebook.add(self.gpo_tab, text="GPOs")
 
         self.build_overview_tab()
         self.build_tasks_tab()
@@ -177,6 +884,7 @@ class ForensicsToolApp:
         self.build_users_tab()
         self.build_questions_tab()
         self.build_reports_tab()
+        self.build_gpo_tab()
 
     def build_overview_tab(self):
         ttk.Label(self.overview_tab, text="Analyst Overview", style="Section.TLabel", bootstyle="info").pack(anchor="w")
@@ -925,6 +1633,13 @@ class ForensicsToolApp:
         except Exception as ex:
             self.status_var.set("Scan failed")
             messagebox.showerror("Scan failed", str(ex))
+
+        try:
+            self.analyze_gpos()
+        except Exception:
+            pass
+
+    
 
 
 def main():
