@@ -1,7 +1,8 @@
 import re
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 import xml.etree.ElementTree as ET
 
@@ -22,12 +23,8 @@ from reports import (
 )
 from users_audit import compare_users_against_authorized
 
-
-
-
-APP_TITLE = "Forensics Tool v5.3"
+APP_TITLE = "Windows Forensics Workbench"
 APP_THEME = "superhero"
-
 
 DEFAULT_GPO_NAMES = {
     "default domain policy",
@@ -42,32 +39,207 @@ GPO_NAME_KEYWORDS_BASELINE = (
     "microsoft baseline",
 )
 
+
+@dataclass
+class ActionRecipe:
+    id: str
+    title: str
+    description: str
+    scope: str
+    severity: str
+    safe_default: bool
+    powershell: str
+
+
+ACTION_RECIPES = {
+    "task_disable": ActionRecipe(
+        id="task_disable",
+        title="Disable suspicious scheduled task",
+        description="Disable the scheduled task so it no longer runs automatically.",
+        scope="Task",
+        severity="High",
+        safe_default=False,
+        powershell=r"Disable-ScheduledTask -TaskPath '{task_path}' -TaskName '{task_name}' -ErrorAction Stop",
+    ),
+    "registry_remove_value": ActionRecipe(
+        id="registry_remove_value",
+        title="Remove suspicious autorun registry value",
+        description="Delete the suspicious persistence value from the registry.",
+        scope="Registry",
+        severity="High",
+        safe_default=False,
+        powershell=r"Remove-ItemProperty -Path '{registry_path}' -Name '{value_name}' -ErrorAction Stop",
+    ),
+    "user_disable": ActionRecipe(
+        id="user_disable",
+        title="Disable unexpected local user",
+        description="Disable the unexpected local account without deleting it.",
+        scope="User",
+        severity="High",
+        safe_default=False,
+        powershell=r"Disable-LocalUser -Name '{user_name}' -ErrorAction Stop",
+    ),
+    "user_remove_admin": ActionRecipe(
+        id="user_remove_admin",
+        title="Remove unexpected user from Administrators",
+        description="Remove the account from the local Administrators group.",
+        scope="User",
+        severity="High",
+        safe_default=False,
+        powershell=r"Remove-LocalGroupMember -Group 'Administrators' -Member '{identity}' -ErrorAction Stop",
+    ),
+    "enable_firewall": ActionRecipe(
+        id="enable_firewall",
+        title="Re-enable Windows Defender Firewall",
+        description="Turn on the firewall for Domain, Private, and Public profiles.",
+        scope="Computer",
+        severity="High",
+        safe_default=True,
+        powershell=r"Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -ErrorAction Stop",
+    ),
+    "enable_defender_realtime": ActionRecipe(
+        id="enable_defender_realtime",
+        title="Enable Defender real-time protection",
+        description="Re-enable Microsoft Defender real-time monitoring.",
+        scope="Computer",
+        severity="High",
+        safe_default=True,
+        powershell=r"Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop",
+    ),
+    "enable_uac_admin_approval": ActionRecipe(
+        id="enable_uac_admin_approval",
+        title="Enable UAC Admin Approval Mode",
+        description="Restore Admin Approval Mode for administrators.",
+        scope="Computer",
+        severity="High",
+        safe_default=True,
+        powershell=r"Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'EnableLUA' -Value 1 -Type DWord -ErrorAction Stop",
+    ),
+    "set_rdp_nla": ActionRecipe(
+        id="set_rdp_nla",
+        title="Require NLA for RDP",
+        description="Keep RDP available but require Network Level Authentication.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=True,
+        powershell=r"Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Type DWord -ErrorAction Stop",
+    ),
+    "disable_rdp": ActionRecipe(
+        id="disable_rdp",
+        title="Disable Remote Desktop",
+        description="Disable incoming Remote Desktop connections on this system.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=False,
+        powershell=r"Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -Type DWord -ErrorAction Stop",
+    ),
+    "set_execpolicy_remotesigned": ActionRecipe(
+        id="set_execpolicy_remotesigned",
+        title="Harden PowerShell script execution",
+        description="Set the local PowerShell execution policy to RemoteSigned.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=False,
+        powershell=r"Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop",
+    ),
+    "require_smb_client_signing": ActionRecipe(
+        id="require_smb_client_signing",
+        title="Require SMB client signing",
+        description="Require SMB signing for the SMB client.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=True,
+        powershell=r"Set-SmbClientConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Force -ErrorAction Stop",
+    ),
+    "require_smb_server_signing": ActionRecipe(
+        id="require_smb_server_signing",
+        title="Require SMB server signing",
+        description="Require SMB signing for the SMB server.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=True,
+        powershell=r"Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Force -ErrorAction Stop",
+    ),
+    "disable_anonymous_everyone": ActionRecipe(
+        id="disable_anonymous_everyone",
+        title="Disallow Everyone permissions for anonymous users",
+        description="Restore the setting so Everyone permissions do not apply to anonymous users.",
+        scope="Computer",
+        severity="High",
+        safe_default=True,
+        powershell=r"Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'EveryoneIncludesAnonymous' -Value 0 -Type DWord -ErrorAction Stop",
+    ),
+    "disable_anonymous_enumeration": ActionRecipe(
+        id="disable_anonymous_enumeration",
+        title="Block anonymous SAM/share enumeration",
+        description="Prevent anonymous enumeration of SAM accounts and shares.",
+        scope="Computer",
+        severity="High",
+        safe_default=True,
+        powershell=r"Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'RestrictAnonymousSAM' -Value 1 -Type DWord -ErrorAction Stop",
+    ),
+    "set_min_password_length_12": ActionRecipe(
+        id="set_min_password_length_12",
+        title="Set minimum password length to 12",
+        description="Increase minimum password length to 12 characters.",
+        scope="Computer",
+        severity="High",
+        safe_default=False,
+        powershell=r"net accounts /minpwlen:12",
+    ),
+    "enable_password_complexity": ActionRecipe(
+        id="enable_password_complexity",
+        title="Enable password complexity",
+        description="Enable password complexity requirements.",
+        scope="Computer",
+        severity="High",
+        safe_default=False,
+        powershell=r"secedit /export /cfg $env:TEMP\secpol.cfg | Out-Null; (Get-Content $env:TEMP\secpol.cfg) -replace 'PasswordComplexity\s*=\s*0','PasswordComplexity = 1' | Set-Content $env:TEMP\secpol.cfg; secedit /configure /db $env:windir\security\database\secedit.sdb /cfg $env:TEMP\secpol.cfg /areas SECURITYPOLICY",
+    ),
+    "set_lockout_threshold_10": ActionRecipe(
+        id="set_lockout_threshold_10",
+        title="Set account lockout threshold to 10",
+        description="Reduce account lockout threshold to 10 failed sign-in attempts.",
+        scope="Computer",
+        severity="Medium",
+        safe_default=False,
+        powershell=r"net accounts /lockoutthreshold:10",
+    ),
+}
+
+
 def get_bool_text(value):
     if isinstance(value, bool):
         return "Yes" if value else "No"
     return str(value or "")
 
+
 def looks_like_default_gpo(name: str) -> bool:
     return (name or "").strip().lower() in DEFAULT_GPO_NAMES
+
 
 def looks_like_baseline_gpo(name: str) -> bool:
     n = (name or "").lower()
     return any(k in n for k in GPO_NAME_KEYWORDS_BASELINE)
+
 
 def _xml_local_name(tag: str) -> str:
     if "}" in tag:
         return tag.split("}", 1)[1]
     return tag
 
+
 def _iter_xml_nodes(root, local_name: str):
     for elem in root.iter():
         if _xml_local_name(elem.tag) == local_name:
             yield elem
 
+
 def _text_or_empty(elem):
     if elem is None or elem.text is None:
         return ""
     return elem.text.strip()
+
 
 def _find_first_desc_text(root, node_name: str) -> str:
     for elem in _iter_xml_nodes(root, node_name):
@@ -75,6 +247,7 @@ def _find_first_desc_text(root, node_name: str) -> str:
         if txt:
             return txt
     return ""
+
 
 def _find_all_text_pairs(root):
     rows = []
@@ -88,11 +261,13 @@ def _find_all_text_pairs(root):
             rows.append(" | ".join(texts))
     return rows
 
+
 def _safe_int(value, default=None):
     try:
         return int(str(value).strip())
     except Exception:
         return default
+
 
 def analyze_gpo_xml_report(xml_text: str) -> dict:
     findings = []
@@ -117,7 +292,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             }
         )
 
-    # Password policy
     m = re.search(r"minimum password length[^0-9]{0,20}(\d+)", blob, re.I)
     if m:
         length = int(m.group(1))
@@ -155,7 +329,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
                 f"Account lockout threshold appears high at {threshold}.",
             )
 
-    # Firewall / Defender
     if re.search(
         r"windows defender firewall[^a-z]{0,40}(disabled|off|false|no)",
         blob,
@@ -189,7 +362,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             "Defender real-time protection appears disabled.",
         )
 
-    # UAC
     if re.search(
         r"user account control: run all administrators in admin approval mode[^a-z]{0,40}(disabled|false|no)",
         blob,
@@ -201,7 +373,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             "Admin Approval Mode appears disabled.",
         )
 
-    # RDP / NLA
     if re.search(
         r"allow users to connect remotely using remote desktop services[^a-z]{0,40}(enabled|true|yes)",
         blob,
@@ -224,7 +395,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
                 "RDP access appears enabled by policy.",
             )
 
-    # SMB / LAN Manager / NTLM
     if re.search(
         r"network security: lan manager authentication level[^|\n]*send lm & ntlm responses",
         blob,
@@ -258,7 +428,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             "SMB server signing does not appear required.",
         )
 
-    # Anonymous access
     if re.search(
         r"network access: do not allow anonymous enumeration of sam accounts and shares[^a-z]{0,40}(disabled|false|no)",
         blob,
@@ -281,7 +450,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             "Everyone permissions appear to apply to anonymous users.",
         )
 
-    # Cached credentials
     m = re.search(
         r"interactive logon: number of previous logons to cache[^0-9]{0,20}(\d+)",
         blob,
@@ -296,7 +464,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
                 f"Cached interactive logons appears set to {cached}.",
             )
 
-    # PowerShell execution (original quick check)
     if re.search(
         r"turn on script execution[^|\n]*(allow all scripts|enabled)",
         blob,
@@ -308,7 +475,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             "PowerShell script execution appears permissive.",
         )
 
-    # NEW: ExecutionPolicy value explicitly set to Bypass / Unrestricted
     if re.search(r"executionpolicy[^\n]{0,80}(bypass|unrestricted)", blob, re.I):
         add_finding(
             "Medium",
@@ -316,7 +482,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             "ExecutionPolicy appears configured to Bypass or Unrestricted in a GPO.",
         )
 
-    # NEW: policy text mentioning Turn on Script Execution + 'allow all scripts'
     if "turn on script execution" in blob and "allow all scripts" in blob:
         add_finding(
             "Medium",
@@ -324,7 +489,6 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
             "Policy 'Turn on Script Execution' is present with language allowing all scripts.",
         )
 
-    # Audit policy quick checks
     if "advanced audit policy configuration" not in blob and "audit policy" not in blob:
         add_finding(
             "Low",
@@ -356,6 +520,7 @@ def analyze_gpo_xml_report(xml_text: str) -> dict:
         "Findings": findings,
         "SettingsBlob": settings_blob,
     }
+
 
 def get_gpo_inventory():
     script = r'''
@@ -576,6 +741,10 @@ class ForensicsToolApp:
         self.apps = []
         self.user_audit = {}
         self.gpos = []
+        self.actions = []
+
+        self.manual_readme_text = ""
+        self.manual_readme_path = ""
 
         self.debug_messages = []
         self.debug_window = None
@@ -650,6 +819,7 @@ class ForensicsToolApp:
             if error_text and not self.gpos:
                 self.gpo_summary_var.set(error_text)
                 self.status_var.set("GPO audit complete")
+                self.populate_actions()
                 return
 
             risky = 0
@@ -679,10 +849,6 @@ class ForensicsToolApp:
                 else:
                     tag = "Info"
 
-                link_summary = ", ".join(gpo.get("LinkTargets", [])[:2])
-                if len(gpo.get("LinkTargets", [])) > 2:
-                    link_summary += " ..."
-
                 self.gpo_tree.insert(
                     "",
                     "end",
@@ -709,10 +875,10 @@ class ForensicsToolApp:
             )
 
             self.status_var.set("GPO audit complete")
+            self.populate_actions()
         except Exception as ex:
             self.status_var.set("GPO audit failed")
             messagebox.showerror("GPO audit failed", str(ex))
-
 
     def on_gpo_selected(self, event=None):
         if not self.gpo_tree.selection():
@@ -864,6 +1030,7 @@ class ForensicsToolApp:
         self.registry_tab = ttk.Frame(self.notebook, padding=14)
         self.apps_tab = ttk.Frame(self.notebook, padding=14)
         self.users_tab = ttk.Frame(self.notebook, padding=14)
+        self.actions_tab = ttk.Frame(self.notebook, padding=14)
         self.questions_tab = ttk.Frame(self.notebook, padding=14)
         self.reports_tab = ttk.Frame(self.notebook, padding=14)
         self.gpo_tab = ttk.Frame(self.notebook, padding=14)
@@ -873,6 +1040,7 @@ class ForensicsToolApp:
         self.notebook.add(self.registry_tab, text="Registry")
         self.notebook.add(self.apps_tab, text="Apps")
         self.notebook.add(self.users_tab, text="Users")
+        self.notebook.add(self.actions_tab, text="Actions")
         self.notebook.add(self.questions_tab, text="Questions")
         self.notebook.add(self.reports_tab, text="Reports")
         self.notebook.add(self.gpo_tab, text="GPOs")
@@ -882,6 +1050,7 @@ class ForensicsToolApp:
         self.build_registry_tab()
         self.build_apps_tab()
         self.build_users_tab()
+        self.build_actions_tab()
         self.build_questions_tab()
         self.build_reports_tab()
         self.build_gpo_tab()
@@ -1002,6 +1171,47 @@ class ForensicsToolApp:
         )
         self.apply_tree_tags(self.apps_tree)
 
+    def on_user_selected(self, event=None):
+        if not self.users_tree.selection():
+            return
+
+        item_id = self.users_tree.selection()[0]
+        item_index = self.users_tree.index(item_id)
+
+        results = self.user_audit.get("Results", [])
+        if item_index < 0 or item_index >= len(results):
+            return
+
+        row = results[item_index]
+
+        lines = [
+            f"Name: {row.get('Name', '')}",
+            f"Identity: {row.get('Identity', '')}",
+            f"Principal Source: {row.get('PrincipalSource', '')}",
+            f"Enabled: {'Yes' if row.get('Enabled') else 'No'}",
+            f"Authorized: {'Yes' if row.get('Authorized') else 'No'}",
+            f"Unexpected: {'Yes' if row.get('Unexpected') else 'No'}",
+            f"Admin: {'Yes' if row.get('IsAdmin') else 'No'}",
+        ]
+
+        if row.get("Unexpected") and row.get("IsAdmin"):
+            lines.append("")
+            lines.append("Assessment: Unexpected administrator account.")
+        elif row.get("Unexpected"):
+            lines.append("")
+            lines.append("Assessment: Unexpected account.")
+        elif row.get("IsAdmin"):
+            lines.append("")
+            lines.append("Assessment: Authorized account with administrator access.")
+        else:
+            lines.append("")
+            lines.append("Assessment: Authorized standard account or expected account state.")
+
+        self.user_detail_text.configure(state="normal")
+        self.user_detail_text.delete("1.0", "end")
+        self.user_detail_text.insert("1.0", "\n".join(lines))
+        self.user_detail_text.configure(state="disabled")
+
     def build_users_tab(self):
         ttk.Label(self.users_tab, text="Authorized vs Current Users", style="Section.TLabel", bootstyle="primary").pack(anchor="w", pady=(0, 8))
 
@@ -1009,12 +1219,19 @@ class ForensicsToolApp:
         topbar.pack(fill=X, pady=(0, 10))
 
         ttk.Button(topbar, text="Analyze Users", command=self.analyze_users_from_readme, bootstyle=PRIMARY).pack(side=LEFT)
+        ttk.Button(topbar, text="Load README File", command=self.load_manual_readme_file, bootstyle=(INFO, OUTLINE)).pack(side=LEFT, padx=8)
 
         self.user_summary_var = ttk.StringVar(value="No user audit run yet.")
         ttk.Label(topbar, textvariable=self.user_summary_var, bootstyle="secondary").pack(side=LEFT, padx=12)
 
+        self.user_readme_source_var = ttk.StringVar(value="README source not identified yet")
+        ttk.Label(topbar, textvariable=self.user_readme_source_var, bootstyle="info").pack(side=LEFT, padx=12)
+
+        upper = ttk.Frame(self.users_tab)
+        upper.pack(fill=BOTH, expand=YES)
+
         self.users_tree = self.build_tree_with_scrollbars(
-            self.users_tab,
+            upper,
             ("unexpected", "admin", "authorized", "enabled", "name", "identity", "source"),
             [
                 ("unexpected", "Unexpected", 110),
@@ -1028,6 +1245,155 @@ class ForensicsToolApp:
             bootstyle="primary",
         )
         self.apply_tree_tags(self.users_tree)
+        self.users_tree.bind("<<TreeviewSelect>>", self.on_user_selected)
+
+        detail_frame = ttk.Labelframe(self.users_tab, text="User Details", padding=12, bootstyle="primary")
+        detail_frame.pack(fill=BOTH, expand=YES, pady=(12, 0))
+
+        self.user_detail_text = tk.Text(
+            detail_frame,
+            wrap="word",
+            height=12,
+            bg="#122033",
+            fg="#e9f2ff",
+            insertbackground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            padx=10,
+            pady=10,
+        )
+        self.user_detail_text.pack(fill=BOTH, expand=YES)
+        self.user_detail_text.insert("1.0", "Select a user row to view details.")
+        self.user_detail_text.configure(state="disabled")
+
+    def load_manual_readme_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select README file",
+            filetypes=[("README files", "*.url *.lnk *.html *.htm *.txt *.md *.text"), ("All files", "*")],
+        )
+        if not file_path:
+            return
+
+        try:
+            text = self._resolve_manual_readme(Path(file_path))
+        except Exception as ex:
+            messagebox.showerror("Load failed", str(ex))
+            return
+
+        self.manual_readme_text = text
+        self.manual_readme_path = file_path
+        self.user_readme_source_var.set(f"README source: {Path(file_path).name}")
+        self.log_debug(f"Loaded manual README file: {file_path}")
+        messagebox.showinfo("README loaded", f"Loaded README from:\n{file_path}")
+
+    def _resolve_manual_readme(self, path: Path) -> str:
+        suffix = path.suffix.lower()
+        if suffix in (".html", ".htm"):
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+            return html_to_text(raw)
+        if suffix in (".txt", ".md", ".text"):
+            return path.read_text(encoding="utf-8", errors="ignore")
+
+        if suffix == ".url":
+            kind, resolved = resolve_url_shortcut(path)
+            if kind == "local" and resolved:
+                if resolved.is_file():
+                    raw = resolved.read_text(encoding="utf-8", errors="ignore")
+                    return html_to_text(raw) if resolved.suffix.lower() in (".html", ".htm") else raw
+                if resolved.is_dir():
+                    for candidate in find_report_candidates_in_directory(resolved):
+                        if candidate.suffix.lower() in (".html", ".htm", ".txt", ".md", ".text"):
+                            raw = candidate.read_text(encoding="utf-8", errors="ignore")
+                            return html_to_text(raw) if candidate.suffix.lower() in (".html", ".htm") else raw
+            if kind == "remote" and resolved:
+                return fetch_url_text(resolved)
+            raise ValueError("Unable to resolve README .url shortcut to usable content.")
+
+        if suffix == ".lnk":
+            resolved = resolve_lnk_shortcut(path)
+            if not resolved:
+                raise ValueError("Unable to resolve README shortcut target.")
+
+            target = (resolved.get("target") or "").strip()
+            args = (resolved.get("args") or "").strip()
+            working_dir = (resolved.get("working_dir") or "").strip()
+
+            if target:
+                target_path = Path(target)
+                if target_path.is_file() and target_path.suffix.lower() in (".html", ".htm", ".txt", ".md", ".text"):
+                    raw = target_path.read_text(encoding="utf-8", errors="ignore")
+                    return html_to_text(raw) if target_path.suffix.lower() in (".html", ".htm") else raw
+
+            combined = f"{target} {args} {working_dir}".strip()
+            m = re.search(r'([A-Za-z]:\\[^\s"]+\\(?:index|report|results|score|scoring)[^\s"]*\.(?:html?|htm))', combined, re.I)
+            if m:
+                possible = Path(m.group(1))
+                if possible.is_file():
+                    raw = possible.read_text(encoding="utf-8", errors="ignore")
+                    return html_to_text(raw)
+
+            raise ValueError("Unable to resolve README .lnk shortcut to usable content.")
+
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+    def build_actions_tab(self):
+        ttk.Label(self.actions_tab, text="Remediation Actions", style="Section.TLabel", bootstyle="warning").pack(anchor="w", pady=(0, 8))
+
+        topbar = ttk.Frame(self.actions_tab)
+        topbar.pack(fill=X, pady=(0, 10))
+
+        ttk.Button(topbar, text="Refresh Actions", command=self.populate_actions, bootstyle=PRIMARY).pack(side=LEFT)
+        ttk.Button(topbar, text="Run Selected", command=self.run_selected_actions, bootstyle=WARNING).pack(side=LEFT, padx=8)
+        ttk.Button(topbar, text="Run All Safe", command=self.run_all_safe_actions, bootstyle=SUCCESS).pack(side=LEFT)
+        ttk.Button(topbar, text="Copy Command", command=self.copy_selected_action_command, bootstyle=(INFO, OUTLINE)).pack(side=LEFT, padx=8)
+
+        self.hide_readme_required_var = ttk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            topbar,
+            text="Hide README-required options",
+            variable=self.hide_readme_required_var,
+            command=self.populate_actions,
+            bootstyle="round-toggle",
+        ).pack(side=LEFT, padx=14)
+
+        self.actions_summary_var = ttk.StringVar(value="No actions generated yet.")
+        ttk.Label(topbar, textvariable=self.actions_summary_var, bootstyle="secondary").pack(side=LEFT, padx=12)
+
+        upper = ttk.Frame(self.actions_tab)
+        upper.pack(fill=BOTH, expand=YES)
+
+        self.actions_tree = self.build_tree_with_scrollbars(
+            upper,
+            ("severity", "safe", "source", "title", "reason"),
+            [
+                ("severity", "Severity", 90),
+                ("safe", "Safe", 70),
+                ("source", "Source", 220),
+                ("title", "Action", 300),
+                ("reason", "Reason", 520),
+            ],
+            bootstyle="warning",
+        )
+        self.apply_tree_tags(self.actions_tree)
+        self.actions_tree.bind("<<TreeviewSelect>>", self.on_action_selected)
+
+        detail_frame = ttk.Labelframe(self.actions_tab, text="Action Details", padding=12, bootstyle="warning")
+        detail_frame.pack(fill=BOTH, expand=YES, pady=(12, 0))
+
+        self.action_detail_text = tk.Text(
+            detail_frame,
+            wrap="word",
+            height=12,
+            bg="#122033",
+            fg="#e9f2ff",
+            insertbackground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            padx=10,
+            pady=10,
+        )
+        self.action_detail_text.pack(fill=BOTH, expand=YES)
+        self.action_detail_text.configure(state="disabled")
 
     def build_questions_tab(self):
         outer = ttk.Frame(self.questions_tab)
@@ -1172,12 +1538,15 @@ class ForensicsToolApp:
         self.card_questions.set_value(len(self.questions))
 
     def add_report_record(self, name, kind, source, content, origin):
+        text_content = content if isinstance(content, str) else str(content or "")
         self.reports.append({
             "name": name,
             "kind": kind,
             "source": str(source),
-            "content": content,
+            "content": text_content,
             "origin": str(origin),
+            "content_length": len(text_content.strip()),
+            "is_error": kind.lower() == "error",
         })
         self.report_list.insert("end", name)
 
@@ -1325,40 +1694,194 @@ class ForensicsToolApp:
 
         self.card_reports.set_value(len(self.reports))
 
+
+    def looks_like_valid_readme_content(self, text: str) -> bool:
+            t = (text or "").strip()
+            if not t:
+                return False
+
+            lower = t.lower()
+
+            known_error_markers = (
+                "<urlopen error",
+                "getaddrinfo failed",
+                "name or service not known",
+                "temporary failure in name resolution",
+                "404 not found",
+                "403 forbidden",
+                "500 internal server error",
+                "unable to resolve shortcut target",
+                "traceback (most recent call last)",
+            )
+            if any(marker in lower for marker in known_error_markers):
+                return False
+
+            if len(t) < 80:
+                return False
+
+            readme_markers = (
+                "authorized users",
+                "approved users",
+                "valid users",
+                "allowed users",
+                "authorized accounts",
+                "approved accounts",
+                "allowed accounts",
+                "authorized administrators",
+                "scenario",
+                "readme",
+                "questions",
+            )
+
+            return any(marker in lower for marker in readme_markers)
+
+    def score_readme_report(self, report: dict) -> int:
+            score = 0
+            name = (report.get("name") or "").lower()
+            kind = (report.get("kind") or "").lower()
+            content = report.get("content") or ""
+            lower = content.lower()
+
+            if "readme" in name:
+                score += 60
+            if kind in {"local html", "resolved url shortcut", "resolved lnk file", "shortcut directory candidate", "lnk directory candidate"}:
+                score += 25
+            if kind == "remote url":
+                score += 10
+            if report.get("is_error"):
+                score -= 1000
+            if "[error]" in name or "unresolved" in name:
+                score -= 250
+
+            if "authorized users" in lower:
+                score += 80
+            if "approved users" in lower or "allowed users" in lower or "authorized accounts" in lower:
+                score += 60
+            if "authorized administrators" in lower:
+                score += 35
+            if "scenario" in lower:
+                score += 15
+
+            score += min(len(content.strip()) // 40, 40)
+
+            if not self.looks_like_valid_readme_content(content):
+                score -= 300
+
+            return score
+
+    def looks_like_scoring_or_results_report(self, text: str) -> bool:
+        t = (text or "").lower()
+        if not t.strip():
+            return False
+
+        scoring_markers = (
+            "score",
+            "scoring",
+            "results",
+            "scorecard",
+            "total score",
+            "risk score",
+            "assessment",
+            "hours",
+        )
+
+        if any(marker in t for marker in scoring_markers):
+            if self.looks_like_valid_readme_content(text):
+                return False
+            return True
+
+        return False
+
     def get_readme_report_text(self) -> str:
+        if self.manual_readme_text.strip():
+            self.log_debug("Using manually loaded README text")
+            return self.manual_readme_text
+
         if not self.reports:
             self.log_debug("get_readme_report_text: no reports loaded")
             return ""
 
         self.log_debug(f"get_readme_report_text: reports loaded = {len(self.reports)}")
 
-        for report in self.reports:
-            name = (report.get("name") or "").lower()
-            content = report.get("content") or ""
-            self.log_debug(f"Report candidate: name={report.get('name')} kind={report.get('kind')}")
-            if "readme" in name and content.strip():
-                self.log_debug(f"Selected README by name: {report.get('name')}")
-                return content
+        ranked = []
 
-        auth_markers = (
-            "authorized users",
-            "approved users",
-            "valid users",
-            "allowed users",
-            "authorized accounts",
-            "approved accounts",
-            "allowed accounts",
-            "authorized administrators",
+        for report in self.reports:
+            name = report.get("name", "")
+            kind = report.get("kind", "")
+            content = report.get("content", "") or ""
+            lower_name = name.lower()
+            lower_kind = kind.lower()
+            lower_content = content.lower()
+
+            score = 0
+
+            if "error" in lower_name or lower_kind == "error":
+                score -= 1000
+            if "unresolved" in lower_name or "unable to resolve shortcut target" in lower_content:
+                score -= 1000
+            if len(content.strip()) < 80:
+                score -= 300
+
+            if "readme" in lower_name:
+                score += 500
+            if "instruction" in lower_name or "instructions" in lower_name:
+                score += 250
+            if "authorized users" in lower_content:
+                score += 400
+            if "approved users" in lower_content or "allowed users" in lower_content:
+                score += 250
+            if "authorized accounts" in lower_content or "allowed accounts" in lower_content:
+                score += 250
+            if "local users" in lower_content or "domain users" in lower_content:
+                score += 120
+            if "administrators" in lower_content:
+                score += 80
+
+            if self.looks_like_scoring_or_results_report(content):
+                score -= 500
+
+            self.log_debug(f"Report candidate: name={name} kind={kind} len={len(content)} score={score}")
+            ranked.append((score, report))
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+
+        for score, report in ranked:
+            name = report.get("name", "")
+            kind = report.get("kind", "")
+            content = report.get("content", "") or ""
+            if score <= 0:
+                self.log_debug(f"Rejected README candidate: {name} ({kind}) score={score}")
+                continue
+            if self.looks_like_scoring_or_results_report(content):
+                self.log_debug(f"Rejected README candidate: {name} ({kind}) looks like scoring/results content")
+                continue
+
+            self.user_readme_source_var.set(f"README source: {name}")
+            self.log_debug(f"Selected README candidate: {name} ({kind}) score={score}")
+            return content
+
+        self.log_debug("No valid README report matched after scoring and validation")
+        self.user_readme_source_var.set("README source: none found")
+        return ""
+
+    def readme_indicates_rdp_required(self) -> bool:
+        text = (self.get_readme_report_text() or "").lower()
+        if not text.strip():
+            return False
+
+        positive_patterns = (
+            r"\brdp\b.*\b(required|needed|must be enabled|should be enabled|enable)\b",
+            r"\bremote desktop\b.*\b(required|needed|must be enabled|should be enabled|enable)\b",
+            r"\bconnect remotely\b.*\b(required|needed)\b",
+        )
+        negative_patterns = (
+            r"\brdp\b.*\b(disabled|disable|must be disabled|should be disabled)\b",
+            r"\bremote desktop\b.*\b(disabled|disable|must be disabled|should be disabled)\b",
         )
 
-        for report in self.reports:
-            content = (report.get("content") or "").lower()
-            if any(marker in content for marker in auth_markers):
-                self.log_debug(f"Selected README by content marker: {report.get('name')}")
-                return report.get("content") or ""
-
-        self.log_debug("No README report matched name or content markers")
-        return ""
+        if any(re.search(p, text, re.I) for p in negative_patterns):
+            return False
+        return any(re.search(p, text, re.I) for p in positive_patterns)
 
     def analyze_users_from_readme(self):
         self.user_summary_var.set("Analyzing users...")
@@ -1370,11 +1893,24 @@ class ForensicsToolApp:
             self.log_debug(f"README text length: {len(readme_text)}")
 
             if not readme_text.strip():
-                self.user_summary_var.set("No README report found.")
-                self.log_debug("No README report text found.")
+                self.user_summary_var.set("No valid README report found.")
+                self.card_users.set_value(0)
+                self.log_debug("No valid README report text found.")
                 messagebox.showwarning(
                     "README not found",
-                    "No README-style report with authorized users could be found in the loaded reports."
+                    "No valid README/instructions file with authorized users could be found.\n\n"
+                    "Use 'Load README File' on the Users tab and select the real README manually."
+                )
+                return
+
+            if self.looks_like_scoring_or_results_report(readme_text):
+                self.user_summary_var.set("Selected file looks like a scoring report, not a README.")
+                self.card_users.set_value(0)
+                self.log_debug("Rejected selected README text because it looks like scoring/results content.")
+                messagebox.showwarning(
+                    "Wrong file type",
+                    "The selected content looks like a scoring/results report, not a README with authorized users.\n\n"
+                    "Load the actual README or instructions file."
                 )
                 return
 
@@ -1386,10 +1922,10 @@ class ForensicsToolApp:
 
             audit = compare_users_against_authorized(readme_text)
             self.user_audit = audit
+
             self.log_debug(f"DomainUsers count: {len(audit.get('Inventory', {}).get('DomainUsers', []))}")
             self.log_debug(f"IsDomainController: {audit.get('Inventory', {}).get('IsDomainController')}")
             self.log_debug(f"DomainAdminCandidates count: {len(audit.get('Inventory', {}).get('DomainAdminCandidates', []))}")
-
             self.log_debug(f"Authorized users parsed: {audit.get('AuthorizedUsers', [])}")
             self.log_debug(f"LocalUsers count: {len(audit.get('Inventory', {}).get('LocalUsers', []))}")
             self.log_debug(f"Administrators count: {len(audit.get('Inventory', {}).get('Administrators', []))}")
@@ -1400,6 +1936,17 @@ class ForensicsToolApp:
             results = audit.get("Results", [])
             inventory = audit.get("Inventory", {})
             authorized = audit.get("AuthorizedUsers", [])
+
+            if not authorized:
+                self.user_summary_var.set("README found, but no authorized users were parsed.")
+                self.card_users.set_value(0)
+                self.log_debug("Authorized list is empty after parsing a valid README.")
+                messagebox.showwarning(
+                    "No authorized users parsed",
+                    "A README candidate was found, but no authorized users were extracted.\n"
+                    "This usually means the parser rules in users_audit.py need to be broadened."
+                )
+                return
 
             unexpected_users = 0
             unexpected_admins = 0
@@ -1445,15 +1992,9 @@ class ForensicsToolApp:
 
             self.card_users.set_value(unexpected_users)
             self.status_var.set("User audit complete")
+            self.populate_actions()
 
-            if not authorized:
-                self.log_debug("Authorized list is empty.")
-                messagebox.showwarning(
-                    "No authorized users parsed",
-                    "The README was found, but no authorized users were extracted.\n"
-                    "Check the README formatting or parser rules."
-                )
-            elif not results:
+            if not results:
                 self.log_debug("No user inventory rows returned.")
                 messagebox.showwarning(
                     "No user inventory returned",
@@ -1578,6 +2119,334 @@ class ForensicsToolApp:
             )
         self.card_apps.set_value(sum(1 for a in self.apps if a.get("LikelyNonDefault")))
 
+    def render_recipe_command(self, recipe_id: str, **kwargs) -> str:
+        recipe = ACTION_RECIPES.get(recipe_id)
+        if not recipe:
+            return ""
+        try:
+            return recipe.powershell.format(**kwargs)
+        except Exception:
+            return recipe.powershell
+
+    def add_action(self, bucket: list, recipe_id: str, source: str, source_name: str, reason: str, severity=None, safe_default=None, readme_required=False, **kwargs):
+        recipe = ACTION_RECIPES.get(recipe_id)
+        if not recipe:
+            return
+        bucket.append({
+            "RecipeId": recipe.id,
+            "Source": source,
+            "SourceName": source_name,
+            "Severity": severity or recipe.severity,
+            "Title": recipe.title,
+            "Description": recipe.description,
+            "PowerShell": self.render_recipe_command(recipe_id, **kwargs),
+            "SafeDefault": recipe.safe_default if safe_default is None else safe_default,
+            "Reason": reason,
+            "ReadmeRequired": bool(readme_required),
+        })
+
+    def build_actions_from_findings(self):
+        actions = []
+        rdp_required = self.readme_indicates_rdp_required()
+
+        for task in self.tasks:
+            if task.get("Suspicious"):
+                self.add_action(
+                    actions,
+                    "task_disable",
+                    source="Task",
+                    source_name=f"{task.get('TaskPath', '')}{task.get('TaskName', '')}",
+                    reason=f"Suspicious scheduled task: {task.get('CommandLine', '')}",
+                    severity=task.get("Severity", "High"),
+                    safe_default=False,
+                    task_path=task.get("TaskPath", "\\"),
+                    task_name=task.get("TaskName", ""),
+                )
+
+        for entry in self.registry_entries:
+            if entry.get("Suspicious"):
+                path = entry.get("RegistryPath", "")
+                name = entry.get("ValueName", "")
+                if path and name:
+                    self.add_action(
+                        actions,
+                        "registry_remove_value",
+                        source="Registry",
+                        source_name=f"{path} :: {name}",
+                        reason=f"Suspicious persistence value: {entry.get('ValueData', '')}",
+                        severity=entry.get("Severity", "High"),
+                        safe_default=False,
+                        registry_path=path,
+                        value_name=name,
+                    )
+
+        for row in self.user_audit.get("Results", []):
+            if not row.get("Unexpected"):
+                continue
+
+            if row.get("IsAdmin"):
+                self.add_action(
+                    actions,
+                    "user_remove_admin",
+                    source="User",
+                    source_name=row.get("Name", "") or row.get("Identity", ""),
+                    reason="Unexpected account is a local administrator.",
+                    severity="High",
+                    safe_default=False,
+                    identity=row.get("Identity", row.get("Name", "")),
+                )
+
+            if row.get("PrincipalSource", "").lower() != "activedirectory":
+                self.add_action(
+                    actions,
+                    "user_disable",
+                    source="User",
+                    source_name=row.get("Name", "") or row.get("Identity", ""),
+                    reason="Unexpected local account found during README comparison.",
+                    severity="High" if row.get("IsAdmin") else "Medium",
+                    safe_default=False,
+                    user_name=row.get("Name", ""),
+                )
+
+        for gpo in self.gpos:
+            for finding in gpo.get("Findings", []):
+                title = (finding.get("Title") or "").lower()
+                detail = finding.get("Detail", "")
+                src_name = gpo.get("DisplayName", "")
+
+                if "firewall disabled" in title:
+                    self.add_action(actions, "enable_firewall", "GPO", src_name, detail)
+
+                elif "defender disabled" in title or "real-time protection disabled" in title:
+                    self.add_action(actions, "enable_defender_realtime", "GPO", src_name, detail)
+
+                elif "uac weakened" in title:
+                    self.add_action(actions, "enable_uac_admin_approval", "GPO", src_name, detail)
+
+                elif "rdp without nla" in title:
+                    self.add_action(actions, "set_rdp_nla", "GPO", src_name, detail, readme_required=rdp_required)
+                    if not rdp_required:
+                        self.add_action(actions, "disable_rdp", "GPO", src_name, "RDP is enabled; disabling it is an optional stronger remediation.", safe_default=False)
+
+                elif title == "rdp enabled":
+                    self.add_action(actions, "set_rdp_nla", "GPO", src_name, detail, readme_required=rdp_required, safe_default=True)
+                    if not rdp_required:
+                        self.add_action(actions, "disable_rdp", "GPO", src_name, "RDP is enabled by policy; disabling it is optional.", safe_default=False)
+
+                elif "weak lan manager auth" in title:
+                    pass
+
+                elif "smb client signing not required" in title:
+                    self.add_action(actions, "require_smb_client_signing", "GPO", src_name, detail)
+
+                elif "smb server signing not required" in title:
+                    self.add_action(actions, "require_smb_server_signing", "GPO", src_name, detail)
+
+                elif "anonymous enumeration allowed" in title:
+                    self.add_action(actions, "disable_anonymous_enumeration", "GPO", src_name, detail)
+
+                elif "anonymous users overly permitted" in title:
+                    self.add_action(actions, "disable_anonymous_everyone", "GPO", src_name, detail)
+
+                elif "weak password length" in title:
+                    self.add_action(actions, "set_min_password_length_12", "GPO", src_name, detail, safe_default=False)
+
+                elif "password complexity disabled" in title:
+                    self.add_action(actions, "enable_password_complexity", "GPO", src_name, detail, safe_default=False)
+
+                elif "no account lockout" in title or "weak account lockout threshold" in title:
+                    self.add_action(actions, "set_lockout_threshold_10", "GPO", src_name, detail, safe_default=False)
+
+                elif "permissive powershell execution" in title or "powershell scripts allowed" in title:
+                    self.add_action(actions, "set_execpolicy_remotesigned", "GPO", src_name, detail, safe_default=False)
+
+        deduped = []
+        seen = set()
+        for a in actions:
+            key = (a["RecipeId"], a["Source"], a["SourceName"], a["PowerShell"])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(a)
+
+        if self.hide_readme_required_var.get():
+            deduped = [a for a in deduped if not a.get("ReadmeRequired")]
+
+        deduped.sort(key=lambda x: (
+            x.get("Severity") != "High",
+            not x.get("SafeDefault", False),
+            x.get("Source", ""),
+            x.get("Title", "").lower(),
+        ))
+        return deduped
+
+    def populate_actions(self):
+        self.actions = self.build_actions_from_findings()
+
+        for item in self.actions_tree.get_children():
+            self.actions_tree.delete(item)
+
+        for idx, action in enumerate(self.actions):
+            sev = action.get("Severity", "Info")
+            tag = "High" if sev == "High" else "Medium" if sev == "Medium" else "Low" if sev == "Low" else "Info"
+            self.actions_tree.insert(
+                "",
+                "end",
+                iid=f"action_{idx}",
+                values=(
+                    action.get("Severity", ""),
+                    "Yes" if action.get("SafeDefault") else "No",
+                    action.get("SourceName", action.get("Source", "")),
+                    action.get("Title", ""),
+                    action.get("Reason", ""),
+                ),
+                tags=(tag,),
+            )
+
+        safe_count = sum(1 for a in self.actions if a.get("SafeDefault"))
+        self.actions_summary_var.set(f"Actions: {len(self.actions)} | Safe-by-default: {safe_count}")
+
+        self.action_detail_text.configure(state="normal")
+        self.action_detail_text.delete("1.0", "end")
+        self.action_detail_text.insert("1.0", "Select an action to see details.")
+        self.action_detail_text.configure(state="disabled")
+
+    def on_action_selected(self, event=None):
+        if not self.actions_tree.selection():
+            return
+
+        iid = self.actions_tree.selection()[0]
+        try:
+            idx = int(iid.split("_", 1)[1])
+        except Exception:
+            return
+
+        if idx < 0 or idx >= len(self.actions):
+            return
+
+        a = self.actions[idx]
+        lines = [
+            f"Title: {a.get('Title', '')}",
+            f"Severity: {a.get('Severity', '')}",
+            f"Source: {a.get('Source', '')}",
+            f"Source Name: {a.get('SourceName', '')}",
+            f"Safe by default: {'Yes' if a.get('SafeDefault') else 'No'}",
+            f"Hidden when README-required: {'Yes' if a.get('ReadmeRequired') else 'No'}",
+            "",
+            "Reason:",
+            a.get("Reason", ""),
+            "",
+            "Description:",
+            a.get("Description", ""),
+            "",
+            "PowerShell:",
+            a.get("PowerShell", ""),
+        ]
+
+        self.action_detail_text.configure(state="normal")
+        self.action_detail_text.delete("1.0", "end")
+        self.action_detail_text.insert("1.0", "\n".join(lines))
+        self.action_detail_text.configure(state="disabled")
+
+    def get_selected_action_indexes(self):
+        indices = []
+        for iid in self.actions_tree.selection():
+            try:
+                indices.append(int(iid.split("_", 1)[1]))
+            except Exception:
+                continue
+        return [i for i in indices if 0 <= i < len(self.actions)]
+
+    def copy_selected_action_command(self):
+        indices = self.get_selected_action_indexes()
+        if not indices:
+            messagebox.showwarning("No action selected", "Select an action first.")
+            return
+        cmd = self.actions[indices[0]].get("PowerShell", "")
+        if not cmd.strip():
+            messagebox.showwarning("No command", "The selected action has no command text.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cmd)
+        self.status_var.set("Action command copied to clipboard")
+
+    def run_powershell_action(self, script_text: str) -> tuple[bool, str]:
+        try:
+            script = rf"""
+$ErrorActionPreference = 'Stop'
+try {{
+    {script_text}
+    [pscustomobject]@{{
+        Success = $true
+        Message = 'OK'
+    }} | ConvertTo-Json -Depth 4 -Compress
+}} catch {{
+    [pscustomobject]@{{
+        Success = $false
+        Message = $_.Exception.Message
+    }} | ConvertTo-Json -Depth 4 -Compress
+}}
+"""
+            result = run_powershell_json(script)
+            if isinstance(result, dict):
+                return bool(result.get("Success", False)), str(result.get("Message", ""))
+            return False, "Unexpected response from PowerShell helper."
+        except Exception as ex:
+            return False, str(ex)
+
+    def run_selected_actions(self):
+        indices = self.get_selected_action_indexes()
+        if not indices:
+            messagebox.showwarning("No selection", "Select one or more actions first.")
+            return
+
+        if not messagebox.askyesno(
+            "Confirm remediation",
+            f"Run {len(indices)} selected remediation action(s)?\n\nThese actions will modify the current Windows system.",
+        ):
+            return
+
+        ok = 0
+        failed = 0
+        for idx in indices:
+            action = self.actions[idx]
+            success, message = self.run_powershell_action(action.get("PowerShell", ""))
+            if success:
+                ok += 1
+                self.log_debug(f"[ACTION OK] {action.get('Title')} :: {message}")
+            else:
+                failed += 1
+                self.log_debug(f"[ACTION FAIL] {action.get('Title')} :: {message}")
+
+        self.status_var.set(f"Remediation complete: {ok} succeeded, {failed} failed")
+        messagebox.showinfo("Remediation complete", f"Succeeded: {ok}\nFailed: {failed}\n\nSee Debug for details.")
+
+    def run_all_safe_actions(self):
+        safe_indices = [i for i, a in enumerate(self.actions) if a.get("SafeDefault")]
+        if not safe_indices:
+            messagebox.showinfo("No safe actions", "There are no safe-by-default actions available.")
+            return
+
+        if not messagebox.askyesno(
+            "Confirm safe remediation",
+            f"Run all {len(safe_indices)} safe-by-default remediation action(s)?",
+        ):
+            return
+
+        ok = 0
+        failed = 0
+        for idx in safe_indices:
+            action = self.actions[idx]
+            success, message = self.run_powershell_action(action.get("PowerShell", ""))
+            if success:
+                ok += 1
+                self.log_debug(f"[ACTION OK] {action.get('Title')} :: {message}")
+            else:
+                failed += 1
+                self.log_debug(f"[ACTION FAIL] {action.get('Title')} :: {message}")
+
+        self.status_var.set(f"Safe remediation complete: {ok} succeeded, {failed} failed")
+        messagebox.showinfo("Safe remediation complete", f"Succeeded: {ok}\nFailed: {failed}\n\nSee Debug for details.")
+
     def scan_all(self):
         try:
             self.status_var.set("Loading question files...")
@@ -1639,7 +2508,10 @@ class ForensicsToolApp:
         except Exception:
             pass
 
-    
+        try:
+            self.populate_actions()
+        except Exception:
+            pass
 
 
 def main():
