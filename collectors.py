@@ -24,6 +24,86 @@ DEFAULT_PUBLISHER_PATTERNS = [
     r"^EPSON",
     r"^Brother",
 ]
+KNOWN_GOOD_TASK_PATTERNS = [
+    r"^\\Microsoft\\Windows\\Application Experience\\.*$",
+    r"^\\Microsoft\\Windows\\AppID\\.*$",
+    r"^\\Microsoft\\Windows\\AppxDeploymentClient\\.*$",
+    r"^\\Microsoft\\Windows\\Autochk\\.*$",
+    r"^\\Microsoft\\Windows\\BitLocker\\.*$",
+    r"^\\Microsoft\\Windows\\CertificateServicesClient\\.*$",
+    r"^\\Microsoft\\Windows\\Chkdsk\\.*$",
+    r"^\\Microsoft\\Windows\\Customer Experience Improvement Program\\.*$",
+    r"^\\Microsoft\\Windows\\Data Integrity Scan\\.*$",
+    r"^\\Microsoft\\Windows\\Defrag\\.*$",
+    r"^\\Microsoft\\Windows\\Diagnosis\\.*$",
+    r"^\\Microsoft\\Windows\\DiskCleanup\\.*$",
+    r"^\\Microsoft\\Windows\\DiskDiagnostic\\.*$",
+    r"^\\Microsoft\\Windows\\FileHistory\\.*$",
+    r"^\\Microsoft\\Windows\\Maintenance\\.*$",
+    r"^\\Microsoft\\Windows\\MemoryDiagnostic\\.*$",
+    r"^\\Microsoft\\Windows\\Mobile Broadband Accounts\\.*$",
+    r"^\\Microsoft\\Windows\\NetTrace\\.*$",
+    r"^\\Microsoft\\Windows\\PLA\\.*$",
+    r"^\\Microsoft\\Windows\\Plug and Play\\.*$",
+    r"^\\Microsoft\\Windows\\Power Efficiency Diagnostics\\.*$",
+    r"^\\Microsoft\\Windows\\Registry\\.*$",
+    r"^\\Microsoft\\Windows\\RemoteAssistance\\.*$",
+    r"^\\Microsoft\\Windows\\Servicing\\.*$",
+    r"^\\Microsoft\\Windows\\SettingSync\\.*$",
+    r"^\\Microsoft\\Windows\\SharedPC\\.*$",
+    r"^\\Microsoft\\Windows\\SoftwareInventoryLogging\\.*$",
+    r"^\\Microsoft\\Windows\\SpacePort\\.*$",
+    r"^\\Microsoft\\Windows\\TaskScheduler\\.*$",
+    r"^\\Microsoft\\Windows\\Time Synchronization\\.*$",
+    r"^\\Microsoft\\Windows\\TPM\\.*$",
+    r"^\\Microsoft\\Windows\\UNP\\.*$",
+    r"^\\Microsoft\\Windows\\WDI\\.*$",
+    r"^\\Microsoft\\Windows\\Windows Defender\\.*$",
+    r"^\\Microsoft\\Windows\\Windows Error Reporting\\.*$",
+    r"^\\Microsoft\\Windows\\Workplace Join\\.*$",
+    r"^\\Microsoft\\Windows\\.NET Framework\\.*$",
+]
+
+KNOWN_GOOD_COMMAND_PATTERNS = [
+    r"(?i)\b%windir%\\system32\\defrag\.exe\b",
+    r"(?i)\b%windir%\\system32\\rundll32\.exe\b.*\b(shell32|dfdwiz|appxdeploymentclient|adproxy|pla|regidle|bfe)\b",
+    r"(?i)\b%windir%\\system32\\mrt\.exe\b",
+    r"(?i)\b%windir%\\system32\\schtasks\.exe\b",
+    r"(?i)\b%windir%\\system32\\svchost\.exe\b",
+    r"(?i)\b%windir%\\system32\\w32tm\.exe\b",
+    r"(?i)\b%windir%\\system32\\wermgr\.exe\b",
+    r"(?i)\b%windir%\\system32\\wsqmcons\.exe\b",
+    r"(?i)\b%windir%\\system32\\rundll32\.exe\b.*\bwindows\.sharedpc\.accountmanager\.dll\b",
+    r"(?i)\b%windir%\\system32\\rundll32\.exe\b.*\bstorageapplicationdata\.dll\b",
+    r"(?i)\b%systemroot%\\system32\\cleanmgr\.exe\b",
+    r"(?i)\b%systemroot%\\system32\\cscript\.exe\b.*\bcaluxxprovider\.vbs\b",
+    r"(?i)\b%systemroot%\\system32\\sihclient\.exe\b",
+    r"(?i)\b%systemroot%\\system32\\winsat\.exe\b",
+    r"(?i)\bc:\\programdata\\microsoft\\windows defender\\platform\\.*\\mpcmdrun\.exe\b",
+]
+
+STRONG_SUSPICIOUS_PATTERNS = [
+    r"(?i)\b-enc(?:odedcommand)?\b",
+    r"(?i)frombase64string",
+    r"(?i)\binvoke-expression\b",
+    r"(?i)\biex\b",
+    r"(?i)\bdownloadstring\b",
+    r"(?i)\bdownloadfile\b",
+    r"(?i)\binvoke-webrequest\b",
+    r"(?i)\binvoke-restmethod\b",
+    r"(?i)\biwr\b",
+    r"(?i)\birm\b",
+    r"(?i)\bhttps?://",
+    r"(?i)\\\\[^\\]+\\",
+]
+
+BENIGN_SYSTEM_PATH_RE = re.compile(
+    r"(?i)(^|[ \"'])((%windir%|%systemroot%)\\(system32|syswow64)\\|c:\\windows\\(system32|syswow64)\\)"
+)
+
+USER_WRITABLE_PATH_RE = re.compile(
+    r"(?i)(\\users\\public\\|\\programdata\\|\\temp\\|\\appdata\\|\\perflogs\\|\\windows\\tasks\\|\\recycle\.bin\\)"
+)
 
 DEFAULT_NAME_PATTERNS = [
     r"^(Microsoft Visual C\+\+|Microsoft Update Health Tools|Microsoft Edge|Microsoft OneDrive|Microsoft Teams|Windows Driver Package|Intel\(|NVIDIA|AMD Software|Realtek|Dell Support|HP Support|Lenovo Vantage)"
@@ -67,7 +147,7 @@ def run_powershell_json(script: str):
 def get_severity(score: int) -> str:
     if score >= 6:
         return "High"
-    if score >= 3:
+    if score >= 4:
         return "Medium"
     if score >= 1:
         return "Low"
@@ -76,48 +156,113 @@ def get_severity(score: int) -> str:
 
 def score_task(task: dict):
     reasons = []
-    cmd = (task.get("CommandLine") or "").strip()
-    path = f"{task.get('TaskPath', '')}{task.get('TaskName', '')}"
+    score = 0
 
+    cmd = (task.get("CommandLine") or "").strip()
+    task_path = task.get("TaskPath", "") or ""
+    task_name = task.get("TaskName", "") or ""
+    full_name = f"{task_path}{task_name}"
+    author = str(task.get("Author", "") or "")
+    user_id = str(task.get("UserId", "") or "")
+    run_level = str(task.get("RunLevel", "") or "")
+    trigger_text = " | ".join(task.get("Triggers", []) or [])
+
+    in_microsoft_tree = bool(re.match(r"^\\Microsoft\\Windows\\", full_name, re.I))
+    microsoft_authored = bool(re.search(r"microsoft", author, re.I))
+    command_is_system = bool(BENIGN_SYSTEM_PATH_RE.search(cmd))
+    command_user_writable = bool(USER_WRITABLE_PATH_RE.search(cmd))
+
+    # Hard allowlist for common in-box tasks
+    for pat in KNOWN_GOOD_TASK_PATTERNS:
+        if re.match(pat, full_name, re.I):
+            if not command_user_writable and not any(re.search(p, cmd, re.I) for p in STRONG_SUSPICIOUS_PATTERNS):
+                task["Score"] = 0
+                task["Severity"] = "Info"
+                task["Reasons"] = ["Known Microsoft maintenance task"]
+                task["Suspicious"] = False
+                return task
+
+    # Soft allowlist for common Microsoft/system command lines
+    for pat in KNOWN_GOOD_COMMAND_PATTERNS:
+        if re.search(pat, cmd, re.I):
+            if in_microsoft_tree or microsoft_authored:
+                task["Score"] = 0
+                task["Severity"] = "Info"
+                task["Reasons"] = ["Known Microsoft/system command line"]
+                task["Suspicious"] = False
+                return task
+
+    # Strong indicators
     if task.get("Hidden") is True:
+        score += 2
         reasons.append("Task is hidden")
-    if "highest" in str(task.get("RunLevel", "")).lower():
+
+    if "highest" in run_level.lower():
+        score += 1
         reasons.append("Runs with highest privileges")
 
-    user_id = str(task.get("UserId", ""))
     if re.search(r"SYSTEM|LOCAL SERVICE|NETWORK SERVICE", user_id, re.I):
+        # SYSTEM alone is very common, so only add a light reason
+        score += 0.5
         reasons.append(f"Runs as privileged account: {user_id}")
 
-    if not re.match(r"^\\Microsoft\\", path, re.I):
-        reasons.append("Task is outside standard Microsoft task path")
-
-    name = str(task.get("TaskName", ""))
-    if re.match(r"^[A-Za-z0-9]{6,}$", name) and re.search(r"[A-Z]", name) and re.search(r"[a-z]", name) and re.search(r"\d", name):
-        reasons.append("Task name appears randomized")
-
-    if SYSTEMLIKE.search(name):
-        reasons.append("Task name mimics system or updater naming")
-
     if SUSPICIOUS_SHELL.search(cmd):
+        score += 1
         reasons.append("Uses a shell or script host")
-    if SUSPICIOUS_PATH.search(cmd):
+
+    if command_user_writable:
+        score += 2
         reasons.append("Executes from a user-writable or unusual path")
+
     if ENCODED.search(cmd):
+        score += 3
         reasons.append("Contains encoded or obfuscated PowerShell indicators")
+
     if NETWORK.search(cmd):
+        score += 2
         reasons.append("Contains network path or URL in action")
 
-    trigger_text = " | ".join(task.get("Triggers", []))
+    if HIDDEN_EXEC.search(cmd):
+        score += 2
+        reasons.append("Uses hidden or bypass-style execution flags")
+
+    if SYSTEMLIKE.search(task_name):
+        # Very light weight by itself
+        score += 0.5
+        reasons.append("Task name mimics system or updater naming")
+
+    if re.match(r"^[A-Za-z0-9]{6,}$", task_name) and re.search(r"[A-Z]", task_name) and re.search(r"[a-z]", task_name) and re.search(r"\d", task_name):
+        if not in_microsoft_tree:
+            score += 1
+            reasons.append("Task name appears randomized")
+
     if re.search(r"LogonTrigger|BootTrigger", trigger_text, re.I):
+        score += 1
         reasons.append("Uses persistence-style trigger")
+
     if re.search(r"PT([1-9]M|1[0-5]M)", trigger_text, re.I):
+        score += 1
         reasons.append("Repeats frequently")
 
-    score = len(reasons)
-    task["Score"] = score
-    task["Severity"] = get_severity(score)
+    # Only lightly penalize non-Microsoft task path if other weirdness exists
+    if not in_microsoft_tree and score >= 2:
+        score += 1
+        reasons.append("Task is outside standard Microsoft task path")
+
+    # If it is Microsoft/in-box and only has weak reasons, de-escalate
+    if (in_microsoft_tree or microsoft_authored or command_is_system) and score <= 2:
+        task["Score"] = 0
+        task["Severity"] = "Info"
+        task["Reasons"] = ["Looks like standard Microsoft/system scheduled task"]
+        task["Suspicious"] = False
+        return task
+
+    final_score = int(score) if score == int(score) else int(score + 0.5)
+
+    task["Score"] = final_score
+    task["Severity"] = get_severity(final_score)
     task["Reasons"] = reasons
-    task["Suspicious"] = score > 0
+    task["Suspicious"] = final_score > 0
     return task
 
 

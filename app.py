@@ -678,6 +678,9 @@ class ForensicsToolApp:
 
             audit = compare_users_against_authorized(readme_text)
             self.user_audit = audit
+            self.log_debug(f"DomainUsers count: {len(audit.get('Inventory', {}).get('DomainUsers', []))}")
+            self.log_debug(f"IsDomainController: {audit.get('Inventory', {}).get('IsDomainController')}")
+            self.log_debug(f"DomainAdminCandidates count: {len(audit.get('Inventory', {}).get('DomainAdminCandidates', []))}")
 
             self.log_debug(f"Authorized users parsed: {audit.get('AuthorizedUsers', [])}")
             self.log_debug(f"LocalUsers count: {len(audit.get('Inventory', {}).get('LocalUsers', []))}")
@@ -728,7 +731,8 @@ class ForensicsToolApp:
                 f"Accounts analysed: {len(results)} | "
                 f"Unexpected users: {unexpected_users} | "
                 f"Unexpected admins: {unexpected_admins} | "
-                f"Domain joined: {bool(inventory.get('PartOfDomain', False))}"
+                f"Domain joined: {bool(inventory.get('PartOfDomain', False))} | "
+                f"Domain users: {len(inventory.get('DomainUsers', []))}"
             )
 
             self.card_users.set_value(unexpected_users)
@@ -826,7 +830,7 @@ class ForensicsToolApp:
                 ),
                 tags=(sev,),
             )
-        self.card_tasks.set_value(sum(1 for t in self.tasks if t.get("Suspicious")))
+        self.card_tasks.set_value(sum(1 for t in self.tasks if t.get("Severity") in {"Medium", "High"}))
 
     def populate_registry(self):
         for item in self.registry_tree.get_children():
