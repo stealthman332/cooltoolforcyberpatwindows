@@ -12,7 +12,7 @@ from ttkbootstrap.widgets.scrolled import ScrolledText
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 
-from collectors import get_installed_programs, get_registry_entries, get_tasks, run_powershell_json, get_local_policy
+from collectors import get_installed_programs, get_registry_entries, get_tasks, run_powershell_json
 from reports import (
     fetch_url_text,
     find_report_candidates_in_directory,
@@ -741,7 +741,6 @@ class ForensicsToolApp:
         self.apps = []
         self.user_audit = {}
         self.gpos = []
-        self.localpolicies = []
         self.actions = []
 
         self.manual_readme_text = ""
@@ -937,147 +936,6 @@ class ForensicsToolApp:
         self.gpo_detail_text.insert("1.0", "\n".join(lines))
         self.gpo_detail_text.configure(state="disabled")
 
-    def build_localpolicy_tab(self):
-        ttk.Label(self.localpolicy_tab, text="Local Security Policy Audit", style="Section.TLabel", bootstyle="info").pack(anchor="w", pady=(0, 8))
-
-        topbar = ttk.Frame(self.localpolicy_tab)
-        topbar.pack(fill=X, pady=(0, 10))
-
-        ttk.Button(topbar, text="Analyze Local Policy", command=self.analyze_local_policy, bootstyle=PRIMARY).pack(side=LEFT)
-
-        self.localpolicy_summary_var = ttk.StringVar(value="No local policy audit run yet.")
-        ttk.Label(topbar, textvariable=self.localpolicy_summary_var, bootstyle="secondary").pack(side=LEFT, padx=12)
-
-        upper = ttk.Frame(self.localpolicy_tab)
-        upper.pack(fill=BOTH, expand=YES)
-
-        self.localpolicy_tree = self.build_tree_with_scrollbars(
-            upper,
-            ("severity", "section", "setting", "current", "default"),
-            [
-                ("severity", "Severity", 80),
-                ("section", "Section", 150),
-                ("setting", "Setting", 250),
-                ("current", "Current Value", 200),
-                ("default", "Default Value", 200),
-            ],
-            bootstyle="info",
-        )
-        self.apply_tree_tags(self.localpolicy_tree)
-        self.localpolicy_tree.bind("<<TreeviewSelect>>", self.on_localpolicy_selected)
-
-        detail_frame = ttk.Labelframe(self.localpolicy_tab, text="Policy Details", padding=12, bootstyle="info")
-        detail_frame.pack(fill=BOTH, expand=YES, pady=(12, 0))
-
-        self.localpolicy_detail_text = tk.Text(
-            detail_frame,
-            wrap="word",
-            height=10,
-            bg="#122033",
-            fg="#e9f2ff",
-            insertbackground="#ffffff",
-            relief="flat",
-            borderwidth=0,
-            padx=10,
-            pady=10,
-        )
-        self.localpolicy_detail_text.pack(fill=BOTH, expand=YES)
-        self.localpolicy_detail_text.configure(state="disabled")
-
-    def analyze_local_policy(self):
-        try:
-            self.status_var.set("Collecting Local Security Policy data...")
-            self.root.update_idletasks()
-
-            policy_data = get_local_policy()
-            self.localpolicies = policy_data.get("Policies", [])
-
-            for item in self.localpolicy_tree.get_children():
-                self.localpolicy_tree.delete(item)
-
-            error_text = policy_data.get("Error", "") or ""
-            if error_text and not self.localpolicies:
-                self.localpolicy_summary_var.set(error_text)
-                self.status_var.set("Local policy audit complete")
-                self.populate_actions()
-                return
-
-            high_count = 0
-            medium_count = 0
-            low_count = 0
-
-            for idx, policy in enumerate(self.localpolicies):
-                severity = policy.get("Severity", "Low")
-                if severity == "High":
-                    high_count += 1
-                    tag = "High"
-                elif severity == "Medium":
-                    medium_count += 1
-                    tag = "Medium"
-                else:
-                    low_count += 1
-                    tag = "Low"
-
-                self.localpolicy_tree.insert(
-                    "",
-                    "end",
-                    iid=f"policy_{idx}",
-                    values=(
-                        severity,
-                        policy.get("Section", ""),
-                        policy.get("Setting", ""),
-                        policy.get("CurrentValue", ""),
-                        policy.get("DefaultValue", ""),
-                    ),
-                    tags=(tag,),
-                )
-
-            self.localpolicy_summary_var.set(
-                f"Non-Default Settings: {len(self.localpolicies)} | "
-                f"High: {high_count} | "
-                f"Medium: {medium_count} | "
-                f"Low: {low_count}"
-            )
-
-            self.status_var.set("Local policy audit complete")
-            self.populate_actions()
-        except Exception as ex:
-            self.status_var.set("Local policy audit failed")
-            messagebox.showerror("Local policy audit failed", str(ex))
-
-    def on_localpolicy_selected(self, event=None):
-        if not self.localpolicy_tree.selection():
-            return
-
-        iid = self.localpolicy_tree.selection()[0]
-        try:
-            idx = int(iid.split("_", 1)[1])
-        except Exception:
-            return
-
-        if idx < 0 or idx >= len(self.localpolicies):
-            return
-
-        policy = self.localpolicies[idx]
-
-        lines = [
-            f"Section: {policy.get('Section', '')}",
-            f"Setting: {policy.get('Setting', '')}",
-            f"Severity: {policy.get('Severity', '')}",
-            "",
-            f"Current Value: {policy.get('CurrentValue', '')}",
-            f"Default Value: {policy.get('DefaultValue', '')}",
-            "",
-            "Analysis:",
-            "This setting has been modified from its Windows default value.",
-            "Review the configuration to ensure it aligns with your security policy.",
-        ]
-
-        self.localpolicy_detail_text.configure(state="normal")
-        self.localpolicy_detail_text.delete("1.0", "end")
-        self.localpolicy_detail_text.insert("1.0", "\n".join(lines))
-        self.localpolicy_detail_text.configure(state="disabled")
-
     def log_debug(self, message: str):
         text = str(message)
         self.debug_messages.append(text)
@@ -1176,7 +1034,6 @@ class ForensicsToolApp:
         self.questions_tab = ttk.Frame(self.notebook, padding=14)
         self.reports_tab = ttk.Frame(self.notebook, padding=14)
         self.gpo_tab = ttk.Frame(self.notebook, padding=14)
-        self.localpolicy_tab = ttk.Frame(self.notebook, padding=14)
 
         self.notebook.add(self.overview_tab, text="Overview")
         self.notebook.add(self.tasks_tab, text="Tasks")
@@ -1187,7 +1044,6 @@ class ForensicsToolApp:
         self.notebook.add(self.questions_tab, text="Questions")
         self.notebook.add(self.reports_tab, text="Reports")
         self.notebook.add(self.gpo_tab, text="GPOs")
-        self.notebook.add(self.localpolicy_tab, text="Local Policy")
 
         self.build_overview_tab()
         self.build_tasks_tab()
@@ -1198,7 +1054,6 @@ class ForensicsToolApp:
         self.build_questions_tab()
         self.build_reports_tab()
         self.build_gpo_tab()
-        self.build_localpolicy_tab()
 
     def build_overview_tab(self):
         ttk.Label(self.overview_tab, text="Analyst Overview", style="Section.TLabel", bootstyle="info").pack(anchor="w")
