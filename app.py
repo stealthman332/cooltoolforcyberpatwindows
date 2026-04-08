@@ -221,7 +221,7 @@ ACTION_RECIPES = {
         scope="Computer",
         severity="Medium",
         safe_default=False,
-        powershell=r"if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Write-Host 'npm not found, installing Node.js...'; winget install -e --id OpenJS.NodeJS -ErrorAction SilentlyContinue | Out-Null; if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw 'Node.js installation failed' } }; Write-Host 'Updating npm...'; npm install -g npm --ErrorAction Stop | Out-Null; Write-Host 'Installing Gemini CLI...'; $env:GOOGLE_API_KEY='AIzaSyBB8sDOwKv2WDQPAECbALSsR3AxCjlcEas'; npm install -g @google/gemini-cli -ErrorAction Stop",
+        powershell=r"if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { Write-Host 'npm not found, installing Node.js...'; winget install -e --id OpenJS.NodeJS -ErrorAction SilentlyContinue | Out-Null; if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw 'Node.js installation failed' } }; Write-Host 'Updating npm...'; npm install -g npm --ErrorAction Stop | Out-Null; Write-Host 'Installing Gemini CLI...'; if (-not $env:GOOGLE_API_KEY) { throw 'GOOGLE_API_KEY environment variable not set' }; npm install -g @google/gemini-cli -ErrorAction Stop",
     ),
 }
 
